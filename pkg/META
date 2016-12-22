@@ -1,0 +1,7 @@
+description = "BitMEX DTC Gateway"
+version = "%%VERSION_NUM%%"
+requires = ""
+archive(byte) = "bmex.cma"
+archive(native) = "bmex.cmxa"
+plugin(byte) = "bmex.cma"
+plugin(native) = "bmex.cmxs"

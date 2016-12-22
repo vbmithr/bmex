@@ -1,0 +1,7 @@
+true : bin_annot, safe_string, warn(-40), \
+     package(bytes), \
+     package(bs-api), \
+     thread
+
+<src> : include
+<test> : include
