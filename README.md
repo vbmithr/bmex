@@ -2,36 +2,23 @@ bmex — BitMEX DTC Gateway
 -------------------------------------------------------------------------------
 %%VERSION%%
 
-bmex is TODO
+bmex is a gateway between the DTC protocol [1] and the BitMEX exchange [2].
 
 bmex is distributed under the ISC license.
 
-Homepage: https://github.com/vbmithr/bmex  
+Homepage: https://github.com/vbmithr/bmex
 
 ## Installation
 
-bmex can be installed with `opam`:
+The instructions are for a debian-like distribution (tested on Debian,
+probably working on Ubuntu).
 
-    opam install bmex
+* Install OCaml: apt-get install ocaml-nox
+* Install OPAM (git version):
+   * git clone git://github.com/ocaml/opam
+   * ./configure && make lib-ext && make && sudo make install
+* Run install script (TODO)
+   * ./install_bmex.sh (TODO)
 
-If you don't use `opam` consult the [`opam`](opam) file for build
-instructions.
-
-## Documentation
-
-The documentation and API reference is generated from the source
-interfaces. It can be consulted [online][doc] or via `odig doc
-bmex`.
-
-[doc]: https://vbmithr.github.io/bmex/doc
-
-## Sample programs
-
-If you installed bmex with `opam` sample programs are located in
-the directory `opam var bmex:doc`.
-
-In the distribution sample programs and tests are located in the
-[`test`](test) directory of the distribution. They can be built and run
-with:
-
-    topkg build --tests true && topkg test 
+[1] http://dtcprotocol.org
+[2] http://www.bitmex.com
