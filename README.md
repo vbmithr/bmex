@@ -14,11 +14,17 @@ The instructions are for a debian-like distribution (tested on Debian,
 probably working on Ubuntu).
 
 * Install OCaml: apt-get install ocaml-nox
-* Install OPAM (git version):
-   * git clone git://github.com/ocaml/opam
-   * ./configure && make lib-ext && make && sudo make install
-* Run install script (TODO)
-   * ./install_bmex.sh (TODO)
+* Install OPAM version >= 1.2.2:
+   * debian >= testing: apt-get install opam
+   * other: http://opam.ocaml.org/doc/Install.html#Binarydistribution
+* Switch to OCaml 4.03.0
+   * opam switch 4.03.0
+   * eval `opam config env`
+   * opam repo add janestreet git://github.com/janestreet/opam-repository
+* Run install script
+   * ./scripts/install_bmex.sh
+* Build the project
+   * make
 
 [1] http://dtcprotocol.org
 [2] http://www.bitmex.com
