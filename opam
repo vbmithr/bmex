@@ -9,7 +9,7 @@ license: "ISC"
 dev-repo: "https://github.com/vbmithr/bmex.git"
 bug-reports: "https://github.com/vbmithr/bmex/issues"
 tags: []
-available: [ ocaml-version = "4.03.0" ]
+available: [ ocaml-version >= "4.03.0" ]
 depends: [
   "ocamlfind" {build}
   "ocamlbuild" {build}
