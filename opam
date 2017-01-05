@@ -1,4 +1,4 @@
-opam-version: "2.0"
+opam-version: "1.2"
 name: "bmex"
 version: "1.0"
 maintainer: "Vincent Bernardoff <vb@luminar.eu.org>"
@@ -9,8 +9,8 @@ license: "ISC"
 dev-repo: "https://github.com/vbmithr/bmex.git"
 bug-reports: "https://github.com/vbmithr/bmex/issues"
 tags: []
+available: [ ocaml-version = "4.03.0" ]
 depends: [
-  "ocaml" {= "4.03.0"}
   "ocamlfind" {build}
   "ocamlbuild" {build}
   "topkg" {build}
