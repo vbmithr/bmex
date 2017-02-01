@@ -19,7 +19,7 @@ module Util = struct
   let rec loop_log_errors ?log f =
     let rec inner () =
       Monitor.try_with_or_error ~name:"loop_log_errors" f >>= function
-      | Ok _ -> assert false
+      | Ok _ -> Deferred.unit
       | Error err ->
           Option.iter log ~f:(fun log -> Log.error log "run: %s" @@ Error.to_string_hum err);
           inner ()
@@ -1591,7 +1591,9 @@ let update_trade cs { Trade.symbol; timestamp; price; size; side; tickDirection;
     in
     String.Table.iter clients ~f:on_client
 
-let bitmex_ws ~instrs_initialized ~orderbook_initialized ~quotes_initialized =
+let bitmex_ws
+    ?(interrupt=Deferred.never ())
+    ~instrs_initialized ~orderbook_initialized ~quotes_initialized =
   let open Ws in
   let buf_cs = Bigstring.create 4096 in
   let trade_update_cs = Cstruct.of_bigarray ~len:MarketData.UpdateTrade.sizeof_cs buf_cs in
@@ -1700,7 +1702,8 @@ let bitmex_ws ~instrs_initialized ~orderbook_initialized ~quotes_initialized =
     Deferred.List.iter usernames ~how:`Parallel ~f:(fun (id, _) -> unsubscribe_client ~addr ~id ())
   end;
   don't_wait_for @@ resubscribe ();
-  let ws = open_connection ~connected ~to_ws ~log:log_ws ~testnet:!use_testnet ~md:true ~topics:[] () in
+  let ws = open_connection ~interrupt ~connected ~to_ws ~log:log_ws
+      ~testnet:!use_testnet ~md:true ~topics:[] () in
   let on_ws_msg msg = match MD.of_yojson msg with
   | Error msg ->
     Log.error log_bitmex "%s" msg;
@@ -1774,18 +1777,30 @@ let bitmex_ws ~instrs_initialized ~orderbook_initialized ~quotes_initialized =
     (fun () -> Pipe.iter ~continue_on_error:true ws ~f:on_ws_msg)
     (fun exn -> Log.error log_bitmex "%s" @@ Exn.to_string exn)
 
-let main tls testnet port daemon sockfile pidfile logfile loglevel ll_ws ll_dtc ll_bitmex crt_path key_path =
+let terminate terminate_bitmex dtc_server bitmex_th =
+  terminate_bitmex () ;
+  Deferred.all_unit [
+    Tcp.Server.close ~close_existing_connections:true dtc_server ;
+    bitmex_th
+  ]
+
+let main timeout tls testnet port daemon
+    sockfile pidfile logfile loglevel
+    ll_ws ll_dtc ll_bitmex crt_path key_path =
   let sockfile = if testnet then add_suffix sockfile "_testnet" else sockfile in
   let pidfile = if testnet then add_suffix pidfile "_testnet" else pidfile in
   let logfile = if testnet then add_suffix logfile "_testnet" else logfile in
   let run ~server ~port =
+    let interrupt = Ivar.create () in
     let instrs_initialized = Ivar.create () in
     let orderbook_initialized = Ivar.create () in
     let quotes_initialized = Ivar.create () in
     Log.info log_bitmex "WS feed starting";
     let bitmex_th =
       Monitor.try_with_or_error begin fun () ->
-        bitmex_ws ~instrs_initialized ~orderbook_initialized ~quotes_initialized
+        bitmex_ws
+          ~interrupt:(Ivar.read interrupt)
+          ~instrs_initialized ~orderbook_initialized ~quotes_initialized
       end >>| function
       | Error err -> Log.error log_bitmex "%s" @@ Error.to_string_hum err
       | Ok () -> ()
@@ -1794,6 +1809,14 @@ let main tls testnet port daemon sockfile pidfile logfile loglevel ll_ws ll_dtc 
       [instrs_initialized; orderbook_initialized; quotes_initialized] >>= fun () ->
     dtcserver ~server ~port >>= fun dtc_server ->
     Log.info log_dtc "DTC server started";
+    Option.iter timeout ~f:begin fun duration ->
+        don't_wait_for begin
+          Clock_ns.after (Time_ns.Span.of_int_sec duration) >>= fun () ->
+          let terminate_bitmex = Ivar.fill_if_empty interrupt in
+          terminate terminate_bitmex dtc_server bitmex_th  >>| fun () ->
+          Log.info log_dtc "All servers terminated"
+        end
+    end ;
     Deferred.all_unit [Tcp.Server.close_finished dtc_server; bitmex_th]
   in
 
@@ -1817,7 +1840,9 @@ let main tls testnet port daemon sockfile pidfile logfile loglevel ll_ws ll_dtc 
     Log.(set_output log_bitmex Output.[stderr (); writer `Text log_writer]);
     Log.(set_output log_ws Output.[stderr (); writer `Text log_writer]);
     Util.conduit_server ~tls ~crt_path ~key_path >>= fun server ->
-    Util.loop_log_errors ~log:log_dtc (fun () -> run ~server ~port)
+    (Util.loop_log_errors ~log:log_dtc (fun () -> run ~server ~port)) >>= fun () ->
+    Gc.full_major () ;
+    Shutdown.exit 0
   end;
   never_returns @@ Scheduler.go ()
 
@@ -1825,6 +1850,7 @@ let command =
   let spec =
     let open Command.Spec in
     empty
+    +> flag "-timeout" (optional int) ~doc:"int Exit after n seconds (debug)"
     +> flag "-tls" no_arg ~doc:" Use TLS"
     +> flag "-testnet" no_arg ~doc:" Use testnet"
     +> flag "-port" (optional_with_default 5567 int) ~doc:"int TCP port to use (5567)"
