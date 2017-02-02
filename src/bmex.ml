@@ -1582,8 +1582,14 @@ let update_trade cs { Trade.symbol; timestamp; price; size; side; tickDirection;
     in
     String.Table.iter clients ~f:on_client
 
+type bitmex_th = {
+  th: unit Deferred.t ;
+  ws: Yojson.Safe.json Pipe.Reader.t ;
+}
+
+let close_bitmex_ws { ws } = Pipe.close_read ws
+
 let bitmex_ws
-    ?(interrupt=Deferred.never ())
     ~instrs_initialized ~orderbook_initialized ~quotes_initialized =
   let open Ws in
   let buf_cs = Bigstring.create 4096 in
@@ -1693,7 +1699,7 @@ let bitmex_ws
     Deferred.List.iter usernames ~how:`Parallel ~f:(fun (id, _) -> unsubscribe_client ~addr ~id ())
   end;
   don't_wait_for @@ resubscribe ();
-  let ws = open_connection ~interrupt ~connected ~to_ws ~log:log_ws
+  let ws = open_connection ~connected ~to_ws ~log:log_ws
       ~testnet:!use_testnet ~md:true ~topics:[] () in
   let on_ws_msg msg = match MD.of_yojson msg with
   | Error msg ->
@@ -1764,15 +1770,17 @@ let bitmex_ws
     Log.error log_bitmex "BitMEX: unexpected multiplexed packet format";
     Deferred.unit
   in
-  Monitor.handle_errors
-    (fun () -> Pipe.iter ~continue_on_error:true ws ~f:on_ws_msg)
-    (fun exn -> Log.error log_bitmex "%s" @@ Exn.to_string exn)
+  let th =
+    Monitor.handle_errors
+      (fun () -> Pipe.iter ~continue_on_error:true ws ~f:on_ws_msg)
+      (fun exn -> Log.error log_bitmex "%s" @@ Exn.to_string exn) in
+  { th ; ws }
 
 let terminate terminate_bitmex dtc_server bitmex_th =
   terminate_bitmex () ;
   Deferred.all_unit [
     Tcp.Server.close ~close_existing_connections:true dtc_server ;
-    bitmex_th
+    (close_bitmex_ws bitmex_th ; bitmex_th.th)
   ]
 
 let main timeout tls testnet port daemon
@@ -1788,13 +1796,7 @@ let main timeout tls testnet port daemon
     let quotes_initialized = Ivar.create () in
     Log.info log_bitmex "WS feed starting";
     let bitmex_th =
-      Monitor.try_with_or_error begin fun () ->
-        bitmex_ws
-          ~interrupt:(Ivar.read interrupt)
-          ~instrs_initialized ~orderbook_initialized ~quotes_initialized
-      end >>| function
-      | Error err -> Log.error log_bitmex "%s" @@ Error.to_string_hum err
-      | Ok () -> ()
+      bitmex_ws ~instrs_initialized ~orderbook_initialized ~quotes_initialized
     in
     Deferred.List.iter ~how:`Parallel ~f:Ivar.read
       [instrs_initialized; orderbook_initialized; quotes_initialized] >>= fun () ->
@@ -1808,7 +1810,7 @@ let main timeout tls testnet port daemon
           Log.info log_dtc "All servers terminated"
         end
     end ;
-    Deferred.all_unit [Tcp.Server.close_finished dtc_server; bitmex_th]
+    Deferred.all_unit [Tcp.Server.close_finished dtc_server; bitmex_th.th]
   in
 
   (* start initilization code *)
