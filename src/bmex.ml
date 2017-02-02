@@ -1379,28 +1379,19 @@ let dtcserver ~server ~port =
         handle_chunk w (consumed + msglen) buf (pos + msglen) (len - msglen)
       end
     in
-    let on_client_io_error exn =
-      Log.error log_dtc "on_client_io_error (%s): %s"
-        Socket.Address.(to_string addr) Exn.(to_string exn)
-    in
-    let cleanup r w =
+    let cleanup () =
       Log.info log_dtc "client %s disconnected" Socket.Address.(to_string addr);
       (match String.Table.find clients addr_str with
       | None -> Deferred.unit
       | Some c ->
         purge_client c;
         Pipe.write client_deleted_w c
-      ) >>= fun () ->
-      String.Table.remove clients addr_str;
-      Deferred.all_unit [Writer.close w; Reader.close r]
+      ) >>| fun () ->
+      String.Table.remove clients addr_str
     in
-    Deferred.ignore @@ Monitor.protect
-      ~name:"server_fun"
-      ~finally:(fun () -> cleanup r w)
-      (fun () ->
-         Monitor.detach_and_iter_errors Writer.(monitor w) ~f:on_client_io_error;
-         Reader.(read_one_chunk_at_a_time r ~handle_chunk:(handle_chunk w 0))
-      )
+    Monitor.protect ~name:"server_fun" ~finally:cleanup (fun () ->
+        Reader.(read_one_chunk_at_a_time r ~handle_chunk:(handle_chunk w 0))
+      ) |> Deferred.ignore
   in
   let on_handler_error_f addr exn =
     Log.error log_dtc "on_handler_error (%s): %s"
