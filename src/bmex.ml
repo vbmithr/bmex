@@ -237,7 +237,7 @@ let heartbeat { addr_str; w; dropped } ival =
     Writer.write_cstruct w cs;
     loop ()
   in
-  Monitor.try_with_or_error ~name:"heatbeat" loop >>| function
+  Monitor.try_with_or_error ~name:"heartbeat" loop >>| function
   | Error _ -> Log.error log_dtc "-/-> %s HB" addr_str
   | Ok _ -> ()
 
