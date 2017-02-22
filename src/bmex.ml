@@ -103,8 +103,6 @@ let uuid_of_b64 b64 =
   | None -> invalid_arg "uuid_of_b64"
   | Some uuid -> Uuidm.to_string uuid
 
-let bitmex_historical = ref ""
-
 let use_testnet = ref false
 let base_uri = ref @@ Uri.of_string "https://www.bitmex.com"
 let my_exchange = ref "BMEX"
@@ -664,7 +662,7 @@ let process addr w msg_cs scratchbuf =
           ~result_text:"Welcome to BitMEX DTC Server for Sierra Chart"
           ~security_definitions_supported:true
           ~market_data_supported:true
-          ~historical_price_data_supported:true
+          ~historical_price_data_supported:false
           ~market_depth_supported:true
           ~market_depth_updates_best_bid_and_ask:true
           ~trading_supported
@@ -843,41 +841,6 @@ let process addr w msg_cs scratchbuf =
     | Some obs ->
       accept obs
     end
-
-  | Some HistoricalPriceDataRequest ->
-    let open HistoricalPriceData in
-    let { Request.request_id; symbol; exchange } = Request.read msg_cs in
-    let { addr_str } = Option.value_exn client in
-    Log.debug log_dtc "<- [%s] HistPriceDataReq %s-%s" addr_str symbol exchange;
-    let r_cs = Cstruct.of_bigarray ~off:0 ~len:Reject.sizeof_cs scratchbuf in
-    let reject k = Printf.ksprintf begin fun reason ->
-        Reject.write r_cs ~request_id "%s" reason;
-        Log.debug log_dtc "-> [%s] HistPriceDataRej" addr_str;
-        Writer.write_cstruct w r_cs;
-      end k
-    in
-    let accept () =
-      match String.Table.find instruments symbol with
-      | None ->
-        reject "No such symbol %s-%s" symbol exchange;
-        Deferred.unit
-      | Some _ ->
-        let f addr te_r te_w =
-          Writer.write_cstruct te_w msg_cs;
-          let r_pipe = Reader.pipe te_r in
-          let w_pipe = Writer.pipe w in
-          Pipe.transfer_id r_pipe w_pipe >>| fun () ->
-          Log.debug log_dtc "-> [%s] <historical data>" addr_str
-        in
-        Monitor.try_with_or_error
-          ~name:"historical_with_connection"
-          (fun () -> Tcp.(with_connection (to_file !bitmex_historical) f)) >>| function
-        | Error err -> reject "Historical data server unavailable"
-        | Ok () -> ()
-    in
-    if !my_exchange <> exchange && not Instrument.(is_index symbol) then
-      reject "No such symbol %s-%s" symbol exchange
-    else don't_wait_for @@ accept ()
 
   | Some OpenOrdersRequest ->
     let open Trading.Order in
@@ -1783,14 +1746,14 @@ let terminate terminate_bitmex dtc_server bitmex_th =
     (close_bitmex_ws bitmex_th ; bitmex_th.th)
   ]
 
-let main timeout tls testnet port daemon
-    sockfile pidfile logfile loglevel
-    ll_ws ll_dtc ll_bitmex crt_path key_path =
-  let sockfile = if testnet then add_suffix sockfile "_testnet" else sockfile in
+let main
+    tls testnet port daemon
+    pidfile logfile loglevel
+    ll_ws ll_dtc ll_bitmex crt_path key_path () =
   let pidfile = if testnet then add_suffix pidfile "_testnet" else pidfile in
   let logfile = if testnet then add_suffix logfile "_testnet" else logfile in
   let run ~server ~port =
-    let interrupt = Ivar.create () in
+    (* let interrupt = Ivar.create () in *)
     let instrs_initialized = Ivar.create () in
     let orderbook_initialized = Ivar.create () in
     let quotes_initialized = Ivar.create () in
@@ -1802,14 +1765,14 @@ let main timeout tls testnet port daemon
       [instrs_initialized; orderbook_initialized; quotes_initialized] >>= fun () ->
     dtcserver ~server ~port >>= fun dtc_server ->
     Log.info log_dtc "DTC server started";
-    Option.iter timeout ~f:begin fun duration ->
-        don't_wait_for begin
-          Clock_ns.after (Time_ns.Span.of_int_sec duration) >>= fun () ->
-          let terminate_bitmex = Ivar.fill_if_empty interrupt in
-          terminate terminate_bitmex dtc_server bitmex_th  >>| fun () ->
-          Log.info log_dtc "All servers terminated"
-        end
-    end ;
+    (* Option.iter timeout ~f:begin fun duration -> *)
+    (*     don't_wait_for begin *)
+    (*       Clock_ns.after (Time_ns.Span.of_int_sec duration) >>= fun () -> *)
+    (*       let terminate_bitmex = Ivar.fill_if_empty interrupt in *)
+    (*       terminate terminate_bitmex dtc_server bitmex_th  >>| fun () -> *)
+    (*       Log.info log_dtc "All servers terminated" *)
+    (*     end *)
+    (* end ; *)
     Deferred.all_unit [Tcp.Server.close_finished dtc_server; bitmex_th.th]
   in
 
@@ -1819,15 +1782,16 @@ let main timeout tls testnet port daemon
     base_uri := Uri.of_string "https://testnet.bitmex.com";
     my_exchange := "BMEXT"
   end;
-  bitmex_historical := sockfile;
 
   Log.set_level log_dtc @@ loglevel_of_int @@ max loglevel ll_dtc;
   Log.set_level log_bitmex @@ loglevel_of_int @@ max loglevel ll_bitmex;
   Log.set_level log_ws @@ loglevel_of_int ll_ws;
 
   if daemon then Daemon.daemonize ~cd:"." ();
-  don't_wait_for begin
-    Lock_file.create_exn pidfile >>= fun () ->
+  stage begin fun `Scheduler_started ->
+    Unix.mkdir ~p:() (Filename.dirname pidfile) >>= fun () ->
+    Unix.mkdir ~p:() (Filename.dirname logfile) >>= fun () ->
+    Lock_file.create_exn ~unlink_on_exit:true pidfile >>= fun () ->
     Writer.open_file ~append:true logfile >>= fun log_writer ->
     Log.(set_output log_dtc Output.[stderr (); writer `Text log_writer]);
     Log.(set_output log_bitmex Output.[stderr (); writer `Text log_writer]);
@@ -1836,29 +1800,26 @@ let main timeout tls testnet port daemon
     (Util.loop_log_errors ~log:log_dtc (fun () -> run ~server ~port)) >>= fun () ->
     Gc.full_major () ;
     Shutdown.exit 0
-  end;
-  never_returns @@ Scheduler.go ()
+  end
 
 let command =
   let spec =
     let open Command.Spec in
     empty
-    +> flag "-timeout" (optional int) ~doc:"int Exit after n seconds (debug)"
-    +> flag "-tls" no_arg ~doc:" Use TLS"
+    +> flag "-tls" no_arg ~doc:" Use TLS (see also -crt-file, -key-file)"
     +> flag "-testnet" no_arg ~doc:" Use testnet"
     +> flag "-port" (optional_with_default 5567 int) ~doc:"int TCP port to use (5567)"
     +> flag "-daemon" no_arg ~doc:" Run as a daemon"
-    +> flag "-sockfile" (optional_with_default "run/bitmex.sock" string) ~doc:"filename UNIX sock to use (run/bitmex.sock)"
     +> flag "-pidfile" (optional_with_default "run/bitmex.pid" string) ~doc:"filename Path of the pid file (run/bitmex.pid)"
     +> flag "-logfile" (optional_with_default "log/bitmex.log" string) ~doc:"filename Path of the log file (log/bitmex.log)"
     +> flag "-loglevel" (optional_with_default 1 int) ~doc:"1-3 global loglevel"
     +> flag "-loglevel-ws" (optional_with_default 1 int) ~doc:"1-3 loglevel for the websocket library"
     +> flag "-loglevel-dtc" (optional_with_default 1 int) ~doc:"1-3 loglevel for DTC"
     +> flag "-loglevel-bitmex" (optional_with_default 1 int) ~doc:"1-3 loglevel for BitMEX"
-    +> flag "-crt-file" (optional_with_default "ssl/bitmex.crt" string) ~doc:"filename crt file to use (TLS)"
-    +> flag "-key-file" (optional_with_default "ssl/bitmex.key" string) ~doc:"filename key file to use (TLS)"
+    +> flag "-crt-file" (optional_with_default "ssl/bitmex.crt" string) ~doc:"filename TLS certificate file to use (ssl/bitmex.crt)"
+    +> flag "-key-file" (optional_with_default "ssl/bitmex.key" string) ~doc:"filename TLS key file to use (ssl/bitmex.key)"
   in
-  Command.basic ~summary:"BitMEX bridge" spec main
+  Command.Staged.async ~summary:"BitMEX bridge" spec main
 
 let () = Command.run command
 
