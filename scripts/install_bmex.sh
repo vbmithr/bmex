@@ -2,7 +2,6 @@
 
 set -x
 
-opam pin add -n -y --dev-repo wamp
 opam pin add -n -y uri git://github.com/vbmithr/ocaml-uri#sexp-dev
 opam pin add -n -y nocrypto git://github.com/vbmithr/ocaml-nocrypto#sexp-dev
 opan pin add -n -y ipaddr git://github.com/vbmithr/ocaml-ipaddr#sexp-dev
