@@ -1,8 +1,8 @@
 all:
-	ocaml pkg/pkg.ml build
+	jbuilder build src/bmex.exe
 
 .PHONY: clean
 
 clean:
-	ocaml pkg/pkg.ml clean
+	rm -rf _build
 

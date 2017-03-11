@@ -6,13 +6,13 @@
 
 (* DTC to BitMEX simple bridge *)
 
-open Core.Std
-open Async.Std
+open Core
+open Async
 open Cohttp_async
 
 open Dtc.Dtc
 
-open Bs_devkit.Core
+open Bs_devkit
 open Bs_api.BMEX
 
 module Util = struct
@@ -116,18 +116,29 @@ let scratchbuf = Bigstring.create 4096
 type instr = {
   mutable instrObj: RespObj.t;
   secdef: SecurityDefinition.Response.t;
-  mutable last_trade_price: (float [@default 0.]);
-  mutable last_trade_size: (int [@default 0]);
-  mutable last_trade_ts: (Time_ns.t [@default Time_ns.epoch]);
-  mutable last_quote_ts: (Time_ns.t [@default Time_ns.epoch]);
-} [@@deriving create]
+  mutable last_trade_price: float;
+  mutable last_trade_size: int;
+  mutable last_trade_ts: Time_ns.t;
+  mutable last_quote_ts: Time_ns.t;
+}
+
+let create_instr
+    ?(last_trade_price = 0.)
+    ?(last_trade_size = 0)
+    ?(last_trade_ts = Time_ns.epoch)
+    ?(last_quote_ts = Time_ns.epoch)
+    ~instrObj ~secdef () = {
+  instrObj ; secdef ;
+  last_trade_price ; last_trade_size ;
+  last_trade_ts ; last_quote_ts
+}
 
 let instruments : instr String.Table.t = String.Table.create ()
 
 type client_update = {
   userid: int;
   update: Ws.update
-} [@@deriving create]
+}
 
 module IS = struct
   module T = struct
@@ -143,7 +154,7 @@ end
 type apikey = {
   key: string;
   secret: Cstruct.t;
-} [@@deriving create]
+}
 
 type subscribe_msg =
   | Subscribe of { addr: string; id: int }
@@ -164,17 +175,17 @@ type client = {
   position: RespObj.t IS.Table.t; (* indexed by account, symbol *)
   margin: RespObj.t IS.Table.t; (* indexed by account, currency *)
   order: RespObj.t Uuid.Table.t Int.Table.t; (* indexed by orderID *)
-  mutable dropped: (int [@default 0]);
+  mutable dropped: int;
   subs: int String.Table.t;
   subs_depth: int String.Table.t;
-  send_secdefs: bool [@default false];
+  send_secdefs: bool;
 
   apikeys : apikey Int.Table.t; (* indexed by account *)
   usernames : String.t list Int.Table.t; (* indexed by account *)
   accounts : Int.t list String.Table.t; (* indexed by SC username *)
-  mutable need_resubscribe: bool [@default false];
-  mutable ta_request_id: int32 [@default 0l];
-} [@@deriving create]
+  mutable need_resubscribe: bool;
+  mutable ta_request_id: int32;
+}
 
 let purge_client { ws_r; to_bitmex_r; to_client_r } =
   Pipe.close_read ws_r;
@@ -198,12 +209,12 @@ let clients : client String.Table.t = String.Table.create ()
 type book_entry = {
   price: float;
   size: int;
-} [@@deriving create]
+}
 
 type books = {
   bids: book_entry Int.Table.t;
   asks: book_entry Int.Table.t;
-} [@@deriving create]
+}
 
 let mapify_ob table =
   let fold_f ~key:_ ~data:{ price; size } map =
@@ -370,7 +381,7 @@ let add_api_keys
     ({ addr_str; apikeys; usernames; accounts } : client)
     ({ id; secret; permissions; enabled; userid } : Rest.ApiKey.entry) =
   if enabled then begin
-    Int.Table.set apikeys ~key:userid ~data:(create_apikey ~key:id ~secret:(Cstruct.of_string secret) ());
+    Int.Table.set apikeys ~key:userid ~data:{ key = id ; secret = (Cstruct.of_string secret) };
     let usernames' = List.filter_map permissions ~f:begin function
       | `Dtc username -> Some username
       | `Perm _ -> None
@@ -631,28 +642,32 @@ let process addr w msg_cs scratchbuf =
       let ws_r, ws_w = Pipe.create () in
       let to_bitmex_r, to_bitmex_w = Pipe.create () in
       let to_client_r, to_client_w = Pipe.create () in
-      create_client
-        ~addr
-        ~addr_str
-        ~w
-        ~ws_r
-        ~ws_w
-        ~to_bitmex_r
-        ~to_bitmex_w
-        ~to_client_r
-        ~to_client_w
-        ~key
-        ~secret:Cstruct.(of_string secret)
-        ~position:IS.Table.(create ())
-        ~margin:IS.Table.(create ())
-        ~order:Int.Table.(create ())
-        ~subs:String.Table.(create ())
-        ~subs_depth:String.Table.(create ())
-        ~send_secdefs
-        ~apikeys:Int.Table.(create ())
-        ~usernames:Int.Table.(create ())
-        ~accounts:String.Table.(create ())
-        ()
+      {
+        addr ;
+        addr_str ;
+        w ;
+        ws_r ;
+        ws_w ;
+        to_bitmex_r ;
+        to_bitmex_w ;
+        to_client_r ;
+        to_client_w ;
+        key ;
+        secret = Cstruct.of_string secret ;
+        position = IS.Table.create () ;
+        margin = IS.Table.create () ;
+        order = Int.Table.create () ;
+        subs = String.Table.create () ;
+        subs_depth = String.Table.create () ;
+        send_secdefs ;
+        apikeys = Int.Table.create () ;
+        usernames = Int.Table.create () ;
+        accounts = String.Table.create () ;
+
+        dropped = 0 ;
+        need_resubscribe = false ;
+        ta_request_id = 0l ;
+      }
     in
     let accept client ~trading_supported =
       let resp =
@@ -1412,7 +1427,7 @@ let insert_instr buf_cs instrObj =
   let key = RespObj.string_exn instrObj "symbol" in
   let secdef = Instrument.to_secdef ~testnet:!use_testnet instrObj in
   let instr = create_instr ~instrObj ~secdef () in
-  let books = Int.Table.(create_books ~bids:(create ()) ~asks:(create ()) ()) in
+  let books = Int.Table.{ bids = create () ; asks = create () ; } in
   String.Table.set instruments key instr;
   String.Table.set orderbooks ~key ~data:books;
   Log.info log_bitmex "inserted instrument %s" key;
@@ -1466,7 +1481,7 @@ let update_depths update_cs action { OrderBook.L2.symbol; id; side; size; price 
   match price, size with
   | Some price, Some size ->
     begin match action with
-    | OB.Partial | Insert | Update -> Int.Table.set table id (create_book_entry ~size ~price ())
+    | OB.Partial | Insert | Update -> Int.Table.set table id { size ; price }
     | Delete -> Int.Table.remove table id
     end;
     let on_client { addr; addr_str; w; subs; subs_depth; _} =
@@ -1725,7 +1740,7 @@ let bitmex_ws
             c.addr_str userid (Yojson.Safe.to_string payload);
           Deferred.unit
         | Update update ->
-          let client_update = create_client_update ~userid ~update () in
+          let client_update = { userid ; update } in
           Pipe.write c.ws_w client_update
         end
     end
