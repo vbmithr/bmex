@@ -1,5 +1,5 @@
 (executables
  ((names (bmex))
   (preprocess (pps (ppx_sexp_conv)))
-  (libraries (uuidm bs-api))
+  (libraries (uuidm dtc bs-api))
   ))

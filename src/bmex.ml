@@ -46,7 +46,7 @@ module Dtc_util = struct
               ~nb_msgs:1
               ~msg_number:1
               ~trade_account:m.Trading.Order.Submit.trade_account
-              ~status:OrderStatus.Rejected
+              ~status:`Rejected
               ~reason:UpdateReason.New_order_rejected
               ~cli_ord_id:m.cli_ord_id
               ~symbol:m.Trading.Order.Submit.symbol
@@ -89,6 +89,38 @@ module Dtc_util = struct
       end
     end
   end
+end
+
+module Instrument = struct
+  open RespObj
+  let is_index symbol = symbol.[0] = '.'
+  let to_secdef ~testnet t =
+    let symbol = string_exn t "symbol" in
+    let index = is_index symbol in
+    let exchange =
+      string_exn t "reference"
+      ^ (if testnet && not index then "T" else "")
+    in
+    let tickSize = float_exn t "tickSize" in
+    let expiration_date = Option.map (string t "expiry") ~f:(fun time ->
+        Time_ns.(of_string time |>
+                 to_int_ns_since_epoch |>
+                 (fun t -> t / 1_000_000_000) |>
+                 Int32.of_int_exn)) in
+    let open SecurityDefinition in
+    Response.create
+      ~symbol
+      ~exchange
+      ~security_type:(if index then Index else Futures)
+      ~descr:""
+      ~min_price_increment:tickSize
+      ~price_display_format:(price_display_format_of_ticksize tickSize)
+      ~currency_value_per_increment:tickSize
+      ~underlying_symbol:(string_exn t "underlyingSymbol")
+      ~updates_bid_ask_only:false
+      ~has_market_depth_data:(not index)
+      ?expiration_date
+      ()
 end
 
 (* Helper functions only useful here *)
@@ -259,37 +291,37 @@ let write_order_update ?(nb_msgs=1) ?(msg_number=1) ~addr_str ~userid ~username 
   let status_reason_of_execType_ordStatus_exn () =
     if execType = ordStatus then
       match execType with
-      | "New" -> OrderStatus.Open, UpdateReason.New_order_accepted
-      | "PartiallyFilled" -> Open, Partially_filled
-      | "Filled" -> Filled, Filled
-      | "DoneForDay" -> Open, General_order_update
-      | "Canceled" -> Canceled, Canceled
-      | "PendingCancel" -> Pending_cancel, General_order_update
-      | "Stopped" -> Open, General_order_update
-      | "Rejected" -> Rejected, New_order_rejected
-      | "PendingNew" -> Pending_open, General_order_update
-      | "Expired" -> Rejected, New_order_rejected
+      | "New" -> `Open, UpdateReason.New_order_accepted
+      | "PartiallyFilled" -> `Open, Partially_filled
+      | "Filled" -> `Filled, Filled
+      | "DoneForDay" -> `Open, General_order_update
+      | "Canceled" -> `Canceled, Canceled
+      | "PendingCancel" -> `Pending_cancel, General_order_update
+      | "Stopped" -> `Open, General_order_update
+      | "Rejected" -> `Rejected, New_order_rejected
+      | "PendingNew" -> `Pending_open, General_order_update
+      | "Expired" -> `Rejected, New_order_rejected
       | _ -> invalid_arg' execType ordStatus
     else
     match execType, ordStatus with
     | "Restated", _ ->
       (match ordStatus with
-      | "New" -> Open, General_order_update
-      | "PartiallyFilled" -> Open, General_order_update
-      | "Filled" -> Filled, General_order_update
-      | "DoneForDay" -> Open, General_order_update
-      | "Canceled" -> Canceled, General_order_update
-      | "PendingCancel" -> Pending_cancel, General_order_update
-      | "Stopped" -> Open, General_order_update
-      | "Rejected" -> Rejected, General_order_update
-      | "PendingNew" -> Pending_open, General_order_update
-      | "Expired" -> Rejected, General_order_update
+      | "New" -> `Open, General_order_update
+      | "PartiallyFilled" -> `Open, General_order_update
+      | "Filled" -> `Filled, General_order_update
+      | "DoneForDay" -> `Open, General_order_update
+      | "Canceled" -> `Canceled, General_order_update
+      | "PendingCancel" -> `Pending_cancel, General_order_update
+      | "Stopped" -> `Open, General_order_update
+      | "Rejected" -> `Rejected, General_order_update
+      | "PendingNew" -> `Pending_open, General_order_update
+      | "Expired" -> `Rejected, General_order_update
       | _ -> invalid_arg' execType ordStatus
       )
-    | "Trade", "Filled" -> Filled, Filled
-    | "Trade", "PartiallyFilled" -> Filled, Partially_filled
-    | "Replaced", "New" -> Open, Cancel_replace_complete
-    | "TriggeredOrActivatedBySystem", "New" -> Open, New_order_accepted
+    | "Trade", "Filled" -> `Filled, Filled
+    | "Trade", "PartiallyFilled" -> `Filled, Partially_filled
+    | "Replaced", "New" -> `Open, Cancel_replace_complete
+    | "TriggeredOrActivatedBySystem", "New" -> `Open, New_order_accepted
     | "Funding", _ -> raise Exit
     | "Settlement", _ -> raise Exit
     | _ -> invalid_arg' execType ordStatus
@@ -686,7 +718,7 @@ let process addr w msg_cs scratchbuf =
           ~bracket_orders_supported:false
           ()
       in
-      don't_wait_for @@ heartbeat client (Int32.to_int_exn m.Request.heartbeat_interval);
+      don't_wait_for @@ heartbeat client m.Request.heartbeat_interval;
       Response.to_cstruct response_cs resp;
       Writer.write_cstruct w response_cs;
       Log.debug log_dtc "-> [%s] %s" addr_str (Response.show resp);
@@ -826,7 +858,7 @@ let process addr w msg_cs scratchbuf =
         Float.Map.fold_right bids ~init:1 ~f:begin fun ~key:price ~data:size lvl ->
           Snapshot.write snap_cs
             ~symbol_id
-            ~side:Buy ~p:price ~v:Float.(of_int size) ~lvl
+            ~side:`Buy ~p:price ~v:Float.(of_int size) ~lvl
             ~first:(lvl = 1) ~last:false;
           Writer.write_cstruct w snap_cs;
           succ lvl
@@ -834,7 +866,7 @@ let process addr w msg_cs scratchbuf =
         Float.Map.fold asks ~init:1 ~f:begin fun ~key:price ~data:size lvl ->
           Snapshot.write snap_cs
             ~symbol_id
-            ~side:Sell ~p:price ~v:Float.(of_int size) ~lvl
+            ~side:`Sell ~p:price ~v:Float.(of_int size) ~lvl
             ~first:(lvl = 1 && Float.Map.is_empty bids) ~last:false;
           Writer.write_cstruct w snap_cs;
           succ lvl
@@ -902,9 +934,9 @@ let process addr w msg_cs scratchbuf =
       Writer.write_cstruct w update_cs
     in
     let is_open o = match RespObj.string_exn o "ordStatus" with
-    | "New" -> Some OrderStatus.Open
-    | "PartiallyFilled" -> Some Partially_filled
-    | "PendingCancel" -> Some Pending_cancel
+    | "New" -> Some `Open
+    | "PartiallyFilled" -> Some `Partially_filled
+    | "PendingCancel" -> Some `Pending_cancel
     | _ -> None
     in
     let get_open_orders ?user_id ?order_id () = match user_id, order_id with
@@ -1141,11 +1173,14 @@ let process addr w msg_cs scratchbuf =
     let accept_exn username userid =
       let uri = Uri.with_path !base_uri "/api/v1/order" in
       let qty = match Option.value_exn ~message:"side is undefined" m.S.side with
-      | Buy -> m.S.qty
-      | Sell -> Float.neg m.S.qty
+      | `Buy -> m.S.qty
+      | `Sell -> Float.neg m.S.qty
       in
       let tif = Option.value_exn ~message:"tif is undefined" m.tif in
       let ordType = Option.value_exn ~message:"ordType is undefined" m.ord_type in
+      let tif = match tif with
+      | `Good_till_date_time -> invalid_arg "good_till_date_time"
+      | #time_in_force as tif -> tif in
       let body =
         ["symbol", `String m.S.symbol;
          "orderQty", `Float qty;
@@ -1184,14 +1219,14 @@ let process addr w msg_cs scratchbuf =
       Dtc_util.Trading.Order.Submit.reject order_update_cs m "Unknown exchange";
       Writer.write_cstruct w order_update_cs;
     end
-    else if m.S.tif = Some Good_till_date_time then begin
+    else if m.S.tif = Some `Good_till_date_time then begin
       Dtc_util.Trading.Order.Submit.reject order_update_cs m "BitMEX does not support TIF Good till datetime";
       Writer.write_cstruct w order_update_cs;
     end
     else
     let on_exn _ =
       Dtc_util.Trading.Order.Submit.update
-        ~status:Rejected ~reason:New_order_rejected
+        ~status:`Rejected ~reason:New_order_rejected
         order_update_cs m
         "exception raised when trying to submit %s" m.S.cli_ord_id;
       Writer.write_cstruct w order_update_cs;
@@ -1258,9 +1293,9 @@ let process addr w msg_cs scratchbuf =
           Some ("orderID", `String orderID);
           if m.Replace.qty <> 0. then Some ("orderQty", `Float m.Replace.qty) else None;
         ] @ begin match ord_type with
-        | Stop_limit when RespObj.bool_exn order "workingIndicator" ->
+        | `Stop_limit when RespObj.bool_exn order "workingIndicator" ->
           Option.value_map p2 ~default:[] ~f:(fun p2 -> ["price", `Float p2])
-        | _ -> price_fields_of_dtc ord_type ?p1 ?p2
+        | #order_type -> price_fields_of_dtc ord_type ?p1 ?p2
         end
       in
       let body_str = Yojson.Safe.to_string @@ `Assoc body in
@@ -1463,7 +1498,10 @@ let update_depths update_cs action { OrderBook.L2.symbol; id; side; size; price 
   (* find_exn cannot raise here *)
   let { bids; asks } =  String.Table.find_exn orderbooks symbol in
   let side = side_of_bmex side in
-  let table = match side with Some Buy -> bids | Some Sell -> asks | None -> failwith "update_depth: empty side" in
+  let table = match side with
+  | Some `Buy -> bids
+  | Some `Sell -> asks
+  | None -> failwith "update_depth: empty side" in
   let price = match price with
   | Some p -> Some p
   | None -> begin match Int.Table.find table id with
