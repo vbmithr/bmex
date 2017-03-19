@@ -2,10 +2,10 @@
 
 set -x
 
-opam pin add -n -y uri git://github.com/vbmithr/ocaml-uri#sexp-dev
-opam pin add -n -y nocrypto git://github.com/vbmithr/ocaml-nocrypto#sexp-dev
-opam pin add -n -y ipaddr git://github.com/vbmithr/ocaml-ipaddr#sexp-dev
-opam pin add -n -y conduit git://github.com/vbmithr/ocaml-conduit#async-with-connection
+opam pin add -n -y --dev-repo uri
+opam pin add -n -y --dev-repo ipaddr
+opam pin add -n -y --dev-repo conduit
+
 opam pin add -n -y cohttp git://github.com/vbmithr/ocaml-cohttp#sexp-dev
 opam pin add -n -y dtc git://github.com/vbmithr/ocaml-dtc
 opam pin add -n -y bs-devkit git://github.com/vbmithr/bs_devkit
