@@ -30,5 +30,16 @@ probably working on Ubuntu).
 
 Sierra Chart expect bmex to run on port 5567 with TLS enabled.
 
+## Upgrade
+
+```
+$ opam pin remove `opam pin -s`
+$ opam update
+$ opam upgrade
+```
+
+Then continue from *Run install script* above.
+
+
 [1] http://dtcprotocol.org
 [2] http://www.bitmex.com
