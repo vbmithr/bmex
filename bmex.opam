@@ -15,6 +15,7 @@ depends: [
   "ocamlbuild" {build}
   "jbuilder" {build}
   "bs-api" {build}
+  "dtc" {build}
 ]
 depopts: []
 build: [ "jbuilder" "build" "@install" ]
