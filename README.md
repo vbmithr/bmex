@@ -25,8 +25,8 @@ probably working on Ubuntu).
 * Build the project
    * make
 * Run the daemon
-   * ./_build/src/bmex.native --help
-   * i.e. ./_build/src/bmex.native -port 5567 -daemon -tls -testnet -loglevel 3
+   * ./_build/default/src/bmex.exe --help
+   * i.e. ./_build/default/src/bmex.exe  -port 5567 -daemon -tls -testnet -loglevel 3
 
 Sierra Chart expect bmex to run on port 5567 with TLS enabled.
 
