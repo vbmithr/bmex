@@ -5,6 +5,7 @@ set -x
 opam pin add -n -y --dev-repo uri
 opam pin add -n -y --dev-repo ipaddr
 opam pin add -n -y --dev-repo conduit
+opam pin add -n -y --dev-repo websocket
 
 opam pin add -n -y cohttp git://github.com/vbmithr/ocaml-cohttp#sexp-dev
 opam pin add -n -y dtc git://github.com/vbmithr/ocaml-dtc
