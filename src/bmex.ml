@@ -16,6 +16,36 @@ open Bs_devkit
 open Bs_api.BMEX
 
 module Util = struct
+  module IS = struct
+    module T = struct
+      type t = Int.t * String.t [@@deriving sexp]
+      let compare = compare
+      let hash = Hashtbl.hash
+    end
+    include T
+    include Hashable.Make (T)
+    module Set = Set.Make (T)
+  end
+
+  let b64_of_uuid uuid_str =
+    match Uuidm.of_string uuid_str with
+    | None -> invalid_arg "Uuidm.of_string"
+    | Some uuid -> Uuidm.to_bytes uuid |> B64.encode
+
+  let uuid_of_b64 b64 =
+    B64.decode b64 |> Uuidm.of_bytes |> function
+    | None -> invalid_arg "uuid_of_b64"
+    | Some uuid -> Uuidm.to_string uuid
+
+  let trade_accountf ~userid ~username =
+    username ^ ":" ^ Int.to_string userid
+
+  let cut_trade_account = function
+  | "" -> None
+  | s -> match String.split s ~on:':' with
+  | [username; id] -> Some (username, Int.of_string id)
+  | _ -> invalid_arg "cut_trade_account"
+
   let rec loop_log_errors ?log f =
     let rec inner () =
       Monitor.try_with_or_error ~name:"loop_log_errors" f >>= function
@@ -35,6 +65,7 @@ module Util = struct
     else
     return `TCP
 end
+open Util
 
 module Dtc_util = struct
   module Trading = struct
@@ -92,48 +123,60 @@ module Dtc_util = struct
 end
 
 module Instrument = struct
-  open RespObj
-  let is_index symbol = symbol.[0] = '.'
-  let to_secdef ~testnet t =
-    let symbol = string_exn t "symbol" in
-    let index = is_index symbol in
-    let exchange =
-      string_exn t "reference"
-      ^ (if testnet && not index then "T" else "")
-    in
-    let tickSize = float_exn t "tickSize" in
-    let expiration_date = Option.map (string t "expiry") ~f:(fun time ->
-        Time_ns.(of_string time |>
-                 to_int_ns_since_epoch |>
-                 (fun t -> t / 1_000_000_000) |>
-                 Int32.of_int_exn)) in
-    let open SecurityDefinition in
-    Response.create
-      ~symbol
-      ~exchange
-      ~security_type:(if index then Index else Futures)
-      ~descr:""
-      ~min_price_increment:tickSize
-      ~price_display_format:(price_display_format_of_ticksize tickSize)
-      ~currency_value_per_increment:tickSize
-      ~underlying_symbol:(string_exn t "underlyingSymbol")
-      ~updates_bid_ask_only:false
-      ~has_market_depth_data:(not index)
-      ?expiration_date
-      ()
+  module RespObj = struct
+    include RespObj
+    let is_index symbol = symbol.[0] = '.'
+    let to_secdef ~testnet t =
+      let symbol = string_exn t "symbol" in
+      let index = is_index symbol in
+      let exchange =
+        string_exn t "reference"
+        ^ (if testnet && not index then "T" else "")
+      in
+      let tickSize = float_exn t "tickSize" in
+      let expiration_date = Option.map (string t "expiry") ~f:(fun time ->
+          Time_ns.(of_string time |>
+                   to_int_ns_since_epoch |>
+                   (fun t -> t / 1_000_000_000) |>
+                   Int32.of_int_exn)) in
+      let open SecurityDefinition in
+      Response.create
+        ~symbol
+        ~exchange
+        ~security_type:(if index then Index else Futures)
+        ~descr:""
+        ~min_price_increment:tickSize
+        ~price_display_format:(price_display_format_of_ticksize tickSize)
+        ~currency_value_per_increment:tickSize
+        ~underlying_symbol:(string_exn t "underlyingSymbol")
+        ~updates_bid_ask_only:false
+        ~has_market_depth_data:(not index)
+        ?expiration_date
+        ()
+  end
+
+  type t = {
+    mutable instrObj: RespObj.t;
+    secdef: SecurityDefinition.Response.t;
+    mutable last_trade_price: float;
+    mutable last_trade_size: int;
+    mutable last_trade_ts: Time_ns.t;
+    mutable last_quote_ts: Time_ns.t;
+  }
+
+  let create
+      ?(last_trade_price = 0.)
+      ?(last_trade_size = 0)
+      ?(last_trade_ts = Time_ns.epoch)
+      ?(last_quote_ts = Time_ns.epoch)
+      ~instrObj ~secdef () = {
+    instrObj ; secdef ;
+    last_trade_price ; last_trade_size ;
+    last_trade_ts ; last_quote_ts
+  }
+
+  let active : t String.Table.t = String.Table.create ()
 end
-
-(* Helper functions only useful here *)
-
-let b64_of_uuid uuid_str =
-  match Uuidm.of_string uuid_str with
-  | None -> invalid_arg "Uuidm.of_string"
-  | Some uuid -> Uuidm.to_bytes uuid |> B64.encode
-
-let uuid_of_b64 b64 =
-  B64.decode b64 |> Uuidm.of_bytes |> function
-  | None -> invalid_arg "uuid_of_b64"
-  | Some uuid -> Uuidm.to_string uuid
 
 let use_testnet = ref false
 let base_uri = ref @@ Uri.of_string "https://www.bitmex.com"
@@ -145,84 +188,86 @@ let log_ws = Log.create ~level:`Error ~on_error:`Raise ~output:Log.Output.[stder
 
 let scratchbuf = Bigstring.create 4096
 
-type instr = {
-  mutable instrObj: RespObj.t;
-  secdef: SecurityDefinition.Response.t;
-  mutable last_trade_price: float;
-  mutable last_trade_size: int;
-  mutable last_trade_ts: Time_ns.t;
-  mutable last_quote_ts: Time_ns.t;
-}
+module Connection = struct
+  type subscribe_msg =
+    | Subscribe of { addr: string; id: int }
+    | Unsubscribe of { addr: string; id: int }
 
-let create_instr
-    ?(last_trade_price = 0.)
-    ?(last_trade_size = 0)
-    ?(last_trade_ts = Time_ns.epoch)
-    ?(last_quote_ts = Time_ns.epoch)
-    ~instrObj ~secdef () = {
-  instrObj ; secdef ;
-  last_trade_price ; last_trade_size ;
-  last_trade_ts ; last_quote_ts
-}
+  type apikey = {
+    key: string;
+    secret: Cstruct.t;
+  }
 
-let instruments : instr String.Table.t = String.Table.create ()
+  type client_update = {
+    userid: int;
+    update: Ws.update
+  }
 
-type client_update = {
-  userid: int;
-  update: Ws.update
-}
+  type t = {
+    addr: Socket.Address.Inet.t;
+    addr_str: string;
+    w: Writer.t;
+    ws_r: client_update Pipe.Reader.t;
+    ws_w: client_update Pipe.Writer.t;
+    to_bitmex_r: subscribe_msg Pipe.Reader.t;
+    to_bitmex_w: subscribe_msg Pipe.Writer.t;
+    to_client_r: subscribe_msg Pipe.Reader.t;
+    to_client_w: subscribe_msg Pipe.Writer.t;
+    key: string;
+    secret: Cstruct.t;
+    position: RespObj.t IS.Table.t; (* indexed by account, symbol *)
+    margin: RespObj.t IS.Table.t; (* indexed by account, currency *)
+    order: RespObj.t Uuid.Table.t Int.Table.t; (* indexed by orderID *)
+    mutable dropped: int;
+    subs: int String.Table.t;
+    subs_depth: int String.Table.t;
+    send_secdefs: bool;
 
-module IS = struct
-  module T = struct
-    type t = Int.t * String.t [@@deriving sexp]
-    let compare = compare
-    let hash = Hashtbl.hash
-  end
-  include T
-  include Hashable.Make (T)
-  module Set = Set.Make (T)
+    apikeys : apikey Int.Table.t; (* indexed by account *)
+    usernames : String.t list Int.Table.t; (* indexed by account *)
+    accounts : Int.t list String.Table.t; (* indexed by SC username *)
+    mutable need_resubscribe: bool;
+    mutable ta_request_id: int32;
+  }
+
+  let create ~addr ~addr_str ~w ~key ~secret ~send_secdefs =
+    let ws_r, ws_w = Pipe.create () in
+    let to_bitmex_r, to_bitmex_w = Pipe.create () in
+    let to_client_r, to_client_w = Pipe.create () in
+    {
+      addr ;
+      addr_str ;
+      w ;
+      ws_r ;
+      ws_w ;
+      to_bitmex_r ;
+      to_bitmex_w ;
+      to_client_r ;
+      to_client_w ;
+      key ;
+      secret = Cstruct.of_string secret ;
+      position = IS.Table.create () ;
+      margin = IS.Table.create () ;
+      order = Int.Table.create () ;
+      subs = String.Table.create () ;
+      subs_depth = String.Table.create () ;
+      send_secdefs ;
+      apikeys = Int.Table.create () ;
+      usernames = Int.Table.create () ;
+      accounts = String.Table.create () ;
+
+      dropped = 0 ;
+      need_resubscribe = false ;
+      ta_request_id = 0l ;
+    }
+
+  let purge { ws_r; to_bitmex_r; to_client_r } =
+    Pipe.close_read ws_r;
+    Pipe.close_read to_bitmex_r;
+    Pipe.close_read to_client_r
+
+  let active : t String.Table.t = String.Table.create ()
 end
-
-type apikey = {
-  key: string;
-  secret: Cstruct.t;
-}
-
-type subscribe_msg =
-  | Subscribe of { addr: string; id: int }
-  | Unsubscribe of { addr: string; id: int }
-
-type client = {
-  addr: Socket.Address.Inet.t;
-  addr_str: string;
-  w: Writer.t;
-  ws_r: client_update Pipe.Reader.t;
-  ws_w: client_update Pipe.Writer.t;
-  to_bitmex_r: subscribe_msg Pipe.Reader.t;
-  to_bitmex_w: subscribe_msg Pipe.Writer.t;
-  to_client_r: subscribe_msg Pipe.Reader.t;
-  to_client_w: subscribe_msg Pipe.Writer.t;
-  key: string;
-  secret: Cstruct.t;
-  position: RespObj.t IS.Table.t; (* indexed by account, symbol *)
-  margin: RespObj.t IS.Table.t; (* indexed by account, currency *)
-  order: RespObj.t Uuid.Table.t Int.Table.t; (* indexed by orderID *)
-  mutable dropped: int;
-  subs: int String.Table.t;
-  subs_depth: int String.Table.t;
-  send_secdefs: bool;
-
-  apikeys : apikey Int.Table.t; (* indexed by account *)
-  usernames : String.t list Int.Table.t; (* indexed by account *)
-  accounts : Int.t list String.Table.t; (* indexed by SC username *)
-  mutable need_resubscribe: bool;
-  mutable ta_request_id: int32;
-}
-
-let purge_client { ws_r; to_bitmex_r; to_client_r } =
-  Pipe.close_read ws_r;
-  Pipe.close_read to_bitmex_r;
-  Pipe.close_read to_client_r
 
 module Order = struct
   exception Found of int * RespObj.t
@@ -236,7 +281,6 @@ module Order = struct
   with Found (account, o) -> Some (account, o)
 end
 
-let clients : client String.Table.t = String.Table.create ()
 
 type book_entry = {
   price: float;
@@ -260,15 +304,8 @@ let mapify_ob table =
 let orderbooks : books String.Table.t = String.Table.create ()
 let quotes : Quote.t String.Table.t = String.Table.create ()
 
-let trade_accountf ~userid ~username = username ^ ":" ^ Int.to_string userid
 
-let cut_trade_account = function
-| "" -> None
-| s -> match String.split s ~on:':' with
-| [username; id] -> Some (username, Int.of_string id)
-| _ -> invalid_arg "cut_trade_account"
-
-let heartbeat { addr_str; w; dropped } ival =
+let heartbeat { Connection.addr_str; w; dropped } ival =
   let open Logon.Heartbeat in
   let cs = Cstruct.create sizeof_cs in
   let rec loop () =
@@ -394,7 +431,7 @@ let write_balance_update ?(msg_number=1) ?(nb_msgs=1) ?(unsolicited=true) ~usern
 let write_trade_accounts c w =
   let open Account.List in
   let cs = Cstruct.of_bigarray ~off:0 ~len:Response.sizeof_cs scratchbuf in
-  let trade_accounts = List.map (Int.Table.keys c.apikeys) ~f:begin fun userid ->
+  let trade_accounts = List.map (Int.Table.keys c.Connection.apikeys) ~f:begin fun userid ->
       match Int.Table.find c.usernames userid with
       | None -> []
       | Some usernames -> List.map usernames ~f:(fun username -> trade_accountf ~userid ~username)
@@ -410,7 +447,7 @@ let write_trade_accounts c w =
   if c.ta_request_id <> 0l then Log.debug log_dtc "-> [%s] TradeAccountResp: %d accounts" c.addr_str nb_msgs
 
 let add_api_keys
-    ({ addr_str; apikeys; usernames; accounts } : client)
+    ({ addr_str; apikeys; usernames; accounts } : Connection.t)
     ({ id; secret; permissions; enabled; userid } : Rest.ApiKey.entry) =
   if enabled then begin
     Int.Table.set apikeys ~key:userid ~data:{ key = id ; secret = (Cstruct.of_string secret) };
@@ -426,7 +463,7 @@ let add_api_keys
     end
   end
 
-let populate_api_keys ({ addr_str; w; to_bitmex_r; to_bitmex_w; to_client_r; to_client_w;
+let populate_api_keys ({ Connection.addr_str; w; to_bitmex_r; to_bitmex_w; to_client_r; to_client_w;
                          key; secret; apikeys; usernames; accounts; need_resubscribe } as c) =
   let rec inner_exn entries =
     Log.debug log_bitmex "[%s] Found %d api keys entries" addr_str @@ List.length entries;
@@ -461,10 +498,7 @@ let populate_api_keys ({ addr_str; w; to_bitmex_r; to_bitmex_w; to_client_r; to_
   Rest.ApiKey.dtc ~log:log_bitmex ~key ~secret ~testnet:!use_testnet () |>
   Deferred.Or_error.bind ~f:inner
 
-let with_userid
-    ({ addr; addr_str; w; ws_r; ws_w; key; secret; position; margin; order;
-       dropped; subs; subs_depth; send_secdefs; apikeys; usernames; accounts }:client)
-    ~userid ~f =
+let with_userid { Connection.addr_str ; key ; secret ; apikeys ; usernames } ~userid ~f =
   Int.Table.iteri apikeys ~f:begin fun ~key:userid' ~data:{ key; secret } ->
     if userid = userid' then
       Int.Table.find usernames userid |> Option.iter ~f:begin fun usernames ->
@@ -475,7 +509,7 @@ let with_userid
       end
   end
 
-let client_ws ({ addr_str; w; ws_r; key; secret; order; margin; position } as c) =
+let client_ws ({ Connection.addr_str; w; ws_r; key; secret; order; margin; position } as c) =
   let position_update_cs = Cstruct.of_bigarray scratchbuf ~len:Trading.Position.Update.sizeof_cs in
   let order_update_cs = Cstruct.of_bigarray scratchbuf ~len:Trading.Order.Update.sizeof_cs in
   let balance_update_cs = Cstruct.of_bigarray scratchbuf ~len:Account.Balance.Update.sizeof_cs in
@@ -604,7 +638,7 @@ let client_ws ({ addr_str; w; ws_r; key; secret; order; margin; position } as c)
     in
     List.iter execs ~f:iter_f
   in
-  let on_update { userid; update={ Ws.table; action; data } } =
+  let on_update { Connection.userid; update={ Ws.table; action; data } } =
     let open Ws in
     (* Erase scratchbuf by security. *)
     Bigstring.set_tail_padded_fixed_string scratchbuf ~padding:'\x00' ~pos:0 ~len:(Bigstring.length scratchbuf) "";
@@ -643,16 +677,16 @@ let process addr w msg_cs scratchbuf =
   Bigstring.set_tail_padded_fixed_string
     scratchbuf ~padding:'\x00' ~pos:0 ~len:(Bigstring.length scratchbuf) "";
   let msg = msg_of_enum Cstruct.LE.(get_uint16 msg_cs 2) in
-  let client = match msg with
+  let conn = match msg with
   | None -> None
   | Some EncodingRequest -> None
   | Some LogonRequest -> None
   | Some msg -> begin
-      match String.Table.find clients addr_str with
+      match String.Table.find Connection.active addr_str with
       | None ->
         Log.error log_dtc "msg type %s and found no client record" (show_msg msg);
         failwith "internal error: no client record"
-      | Some client -> Some client
+      | Some conn -> Some conn
     end
   in
   match msg with
@@ -670,37 +704,7 @@ let process addr w msg_cs scratchbuf =
     let response_cs = Cstruct.of_bigarray scratchbuf ~len:Response.sizeof_cs in
     Log.debug log_dtc "<- [%s] %s" addr_str (Request.show m);
     let send_secdefs = Int32.(bit_and m.integer_1 128l <> 0l) in
-    let create_client ~key ~secret =
-      let ws_r, ws_w = Pipe.create () in
-      let to_bitmex_r, to_bitmex_w = Pipe.create () in
-      let to_client_r, to_client_w = Pipe.create () in
-      {
-        addr ;
-        addr_str ;
-        w ;
-        ws_r ;
-        ws_w ;
-        to_bitmex_r ;
-        to_bitmex_w ;
-        to_client_r ;
-        to_client_w ;
-        key ;
-        secret = Cstruct.of_string secret ;
-        position = IS.Table.create () ;
-        margin = IS.Table.create () ;
-        order = Int.Table.create () ;
-        subs = String.Table.create () ;
-        subs_depth = String.Table.create () ;
-        send_secdefs ;
-        apikeys = Int.Table.create () ;
-        usernames = Int.Table.create () ;
-        accounts = String.Table.create () ;
 
-        dropped = 0 ;
-        need_resubscribe = false ;
-        ta_request_id = 0l ;
-      }
-    in
     let accept client ~trading_supported =
       let resp =
         Response.create
@@ -723,32 +727,33 @@ let process addr w msg_cs scratchbuf =
       Writer.write_cstruct w response_cs;
       Log.debug log_dtc "-> [%s] %s" addr_str (Response.show resp);
       let secdef_resp_cs = Cstruct.of_bigarray scratchbuf ~len:SecurityDefinition.Response.sizeof_cs in
-      let on_instrument { secdef } =
+      let on_instrument { Instrument.secdef } =
         SecurityDefinition.Response.to_cstruct secdef_resp_cs { secdef with final = true; request_id = 110_000_000l };
         Writer.write_cstruct w secdef_resp_cs
       in
-      if send_secdefs then ignore @@ String.Table.iter instruments ~f:on_instrument
+      if send_secdefs then ignore @@ String.Table.iter Instrument.active ~f:on_instrument
     in
-    let client = create_client m.username m.general_text_data in
-    String.Table.set clients ~key:addr_str ~data:client;
+    let conn = Connection.create ~addr ~addr_str ~w
+        ~key: m.username ~secret:m.general_text_data ~send_secdefs in
+    String.Table.set Connection.active ~key:addr_str ~data:conn;
     don't_wait_for begin
-      Pipe.write new_client_accepted_w client >>= fun () ->
-      client_ws client >>| function
-      | Ok () -> accept client ~trading_supported:true
+      Pipe.write new_client_accepted_w conn >>= fun () ->
+      client_ws conn >>| function
+      | Ok () -> accept conn ~trading_supported:true
       | Error err ->
         Log.error log_bitmex "%s" @@ Error.to_string_hum err;
-        accept client ~trading_supported:false
+        accept conn ~trading_supported:false
     end
 
   | Some Heartbeat ->
-    Option.iter client ~f:begin fun { addr_str } ->
+    Option.iter conn ~f:begin fun { addr_str } ->
       Log.debug log_dtc "<- [%s] HB" addr_str
     end
 
   | Some SecurityDefinitionForSymbolRequest ->
     let open SecurityDefinition in
     let { Request.id; symbol; exchange } = Request.read msg_cs in
-    let { addr_str } = Option.value_exn client in
+    let { Connection.addr_str } = Option.value_exn conn in
     Log.debug log_dtc "<- [%s] SeqDefReq %s-%s" addr_str symbol exchange;
     let reject_cs = Cstruct.of_bigarray scratchbuf ~len:Reject.sizeof_cs in
     let reject k = Printf.ksprintf begin fun msg ->
@@ -757,11 +762,11 @@ let process addr w msg_cs scratchbuf =
         Writer.write_cstruct w reject_cs
       end k
     in
-    if !my_exchange <> exchange && not Instrument.(is_index symbol) then
+    if !my_exchange <> exchange && not Instrument.RespObj.(is_index symbol) then
       reject "No such symbol %s-%s" symbol exchange
-    else begin match String.Table.find instruments symbol with
+    else begin match String.Table.find Instrument.active symbol with
     | None -> reject "No such symbol %s-%s" symbol exchange
-    | Some { secdef } ->
+    | Some { Instrument.secdef } ->
       let open Response in
       let secdef = { secdef with request_id = id; final = true } in
       Log.debug log_dtc "-> [%s] SeqDefResp %s-%s" addr_str symbol exchange;
@@ -774,7 +779,7 @@ let process addr w msg_cs scratchbuf =
     let open MarketData in
     let { Request.action; symbol_id; symbol; exchange } = Request.read msg_cs in
     Log.debug log_dtc "<- [%s] MarketDataReq %s %s-%s" addr_str (RequestAction.show action) symbol exchange;
-    let { addr_str; subs } = Option.value_exn client in
+    let { Connection.addr_str; subs } = Option.value_exn conn in
     let r_cs = Cstruct.of_bigarray ~off:0 ~len:Reject.sizeof_cs scratchbuf in
     let reject k = Printf.ksprintf begin fun reason ->
         Reject.write r_cs ~symbol_id "%s" reason;
@@ -782,10 +787,10 @@ let process addr w msg_cs scratchbuf =
         Writer.write_cstruct w r_cs
       end k
     in
-    let snap_of_instr { instrObj; last_trade_price; last_trade_size; last_trade_ts; last_quote_ts } =
+    let snap_of_instr { Instrument.instrObj; last_trade_price; last_trade_size; last_trade_ts; last_quote_ts } =
       if action = Unsubscribe then String.Table.remove subs symbol;
       if action = Subscribe then String.Table.set subs symbol symbol_id;
-      if Instrument.is_index symbol then
+      if Instrument.RespObj.is_index symbol then
         Snapshot.create
           ~symbol_id:symbol_id
           ?session_settlement_price:(RespObj.float instrObj "prevPrice24h")
@@ -813,9 +818,9 @@ let process addr w msg_cs scratchbuf =
         ~bid_ask_ts:last_quote_ts
         ()
     in
-    if !my_exchange <> exchange && not Instrument.(is_index symbol) then
+    if !my_exchange <> exchange && not Instrument.RespObj.(is_index symbol) then
       reject "No such symbol %s-%s" symbol exchange
-    else begin match String.Table.find instruments symbol with
+    else begin match String.Table.find Instrument.active symbol with
     | None -> reject "No such symbol %s-%s" symbol exchange
     | Some instr -> try
       let snap = snap_of_instr instr in
@@ -835,7 +840,7 @@ let process addr w msg_cs scratchbuf =
   | Some MarketDepthRequest ->
     let open MarketDepth in
     let { Request.action; symbol_id; symbol; exchange; nb_levels } = Request.read msg_cs in
-    let { addr_str; subs_depth } = Option.value_exn client in
+    let { Connection.addr_str; subs_depth } = Option.value_exn conn in
     Log.debug log_dtc "<- [%s] MarketDepthReq %s-%s %d" addr_str symbol exchange nb_levels;
     let r_cs = Cstruct.of_bigarray ~off:0 ~len:Reject.sizeof_cs scratchbuf in
     let reject k = Printf.ksprintf begin fun msg ->
@@ -875,11 +880,11 @@ let process addr w msg_cs scratchbuf =
         Writer.write_cstruct w snap_cs
       end
     in
-    if Instrument.is_index symbol then
+    if Instrument.RespObj.is_index symbol then
       reject "%s is an index" symbol
     else if !my_exchange <> exchange then
       reject "No such symbol %s-%s" symbol exchange
-    else if action <> Unsubscribe && not @@ String.Table.mem instruments symbol then
+    else if action <> Unsubscribe && not @@ String.Table.mem Instrument.active symbol then
       reject "No such symbol %s-%s" symbol exchange
     else begin match String.Table.find orderbooks symbol with
     | None ->
@@ -892,7 +897,7 @@ let process addr w msg_cs scratchbuf =
   | Some OpenOrdersRequest ->
     let open Trading.Order in
     let ({ Open.Request.id; order; trade_account } as m) = Open.Request.read msg_cs in
-    let ({ addr_str; order=order_table } as c) = Option.value_exn client in
+    let ({ Connection.addr_str; order=order_table } as c) = Option.value_exn conn in
     Log.debug log_dtc "<- [%s] OpenOrdersReq (%ld) (%s) (%s)" addr_str id m.order m.trade_account;
     let reject_cs = Cstruct.of_bigarray ~off:0 ~len:Open.Reject.sizeof_cs scratchbuf in
     let update_cs = Cstruct.of_bigarray ~off:0 ~len:Update.sizeof_cs scratchbuf in
@@ -996,7 +1001,7 @@ let process addr w msg_cs scratchbuf =
     let { Request.id; trade_account } = Request.read msg_cs in
     let reject_cs = Cstruct.of_bigarray ~off:0 ~len:Reject.sizeof_cs scratchbuf in
     let update_cs = Cstruct.of_bigarray ~off:0 ~len:Update.sizeof_cs scratchbuf in
-    let ({ addr_str; position } as c) = Option.value_exn client in
+    let ({ Connection.addr_str; position } as c) = Option.value_exn conn in
     Log.debug log_dtc "<- [%s] PosReq (%s)" addr_str trade_account;
     let write_position ~nb_msgs ~msg_number ~request_id ~trade_account p =
       let userid = RespObj.int_exn p "account" in
@@ -1047,7 +1052,7 @@ let process addr w msg_cs scratchbuf =
     let m = Request.read msg_cs in
     let reject_cs = Cstruct.of_bigarray scratchbuf ~len:Reject.sizeof_cs in
     let response_cs = Cstruct.of_bigarray scratchbuf ~len:Response.sizeof_cs in
-    let ({ addr_str; apikeys } as c) = Option.value_exn client in
+    let ({ Connection.addr_str; apikeys } as c) = Option.value_exn conn in
     Log.debug log_dtc "<- [%s] HistFillsReq (%s)" addr_str m.trade_account;
     let uri = Uri.with_path !base_uri "/api/v1/execution/tradeHistory" in
     let req = List.filter_opt [
@@ -1114,7 +1119,7 @@ let process addr w msg_cs scratchbuf =
   | Some TradeAccountsRequest ->
     let open Account.List in
     let { Request.id } = Request.read msg_cs in
-    let c = Option.value_exn client in
+    let c = Option.value_exn conn in
     Log.debug log_dtc "<- [%s] TradeAccountsReq (%ld)" c.addr_str id;
     c.ta_request_id <- id;
     write_trade_accounts c w
@@ -1122,7 +1127,7 @@ let process addr w msg_cs scratchbuf =
   | Some AccountBalanceRequest ->
     let open Account.Balance in
     let { Request.id; trade_account } = Request.read msg_cs in
-    let { addr_str; margin; usernames } = Option.value_exn client in
+    let { Connection.addr_str; margin; usernames } = Option.value_exn conn in
     let r_cs = Cstruct.of_bigarray ~off:0 ~len:Reject.sizeof_cs scratchbuf in
     let update_cs = Cstruct.of_bigarray ~off:0 ~len:Update.sizeof_cs scratchbuf in
     let reject k = Printf.ksprintf begin fun reason ->
@@ -1167,7 +1172,7 @@ let process addr w msg_cs scratchbuf =
     let module S = Trading.Order.Submit in
     let module U = Trading.Order.Update in
     let m = S.read msg_cs in
-    let { addr_str; apikeys } as c = Option.value_exn client in
+    let { Connection.addr_str; apikeys } as c = Option.value_exn conn in
     let order_update_cs = Cstruct.of_bigarray ~off:0 ~len:U.sizeof_cs scratchbuf in
     Log.debug log_dtc "<- [%s] %s" addr_str (S.show m);
     let accept_exn username userid =
@@ -1265,7 +1270,7 @@ let process addr w msg_cs scratchbuf =
       end k
     in
     let m = Replace.read msg_cs in
-    let ({ addr_str; order } as c) = Option.value_exn client in
+    let ({ Connection.addr_str; order } as c) = Option.value_exn conn in
     Log.debug log_dtc "<- [%s] %s" addr_str (Replace.show m);
     let uri = Uri.with_path !base_uri "/api/v1/order" in
     let update_order ~userid ~username ~key ~secret ~body ~body_str =
@@ -1323,7 +1328,7 @@ let process addr w msg_cs scratchbuf =
 
   | Some CancelOrder ->
     let open Trading.Order in
-    let ({ addr_str; order } as c) = Option.value_exn client in
+    let ({ Connection.addr_str; order } as c) = Option.value_exn conn in
     let { Cancel.srv_ord_id; cli_ord_id } = Cancel.read msg_cs in
     let reject ~userid ~username k =
       let trade_account = trade_accountf ~userid ~username in
@@ -1343,7 +1348,7 @@ let process addr w msg_cs scratchbuf =
       end k
     in
     let hex_srv_ord_id = uuid_of_b64 srv_ord_id in
-    let { addr_str } = Option.value_exn client in
+    let { Connection.addr_str } = Option.value_exn conn in
     Log.debug log_dtc "<- [%s] Cancelorder cli=%s srv=%s" addr_str cli_ord_id hex_srv_ord_id;
 
     let cancel_order ~userid ~username ~key ~secret hex_srv_ord_id =
@@ -1394,13 +1399,13 @@ let dtcserver ~server ~port =
     in
     let cleanup () =
       Log.info log_dtc "client %s disconnected" Socket.Address.(to_string addr);
-      (match String.Table.find clients addr_str with
+      (match String.Table.find Connection.active addr_str with
       | None -> Deferred.unit
       | Some c ->
-        purge_client c;
+        Connection.purge c;
         Pipe.write client_deleted_w c
       ) >>| fun () ->
-      String.Table.remove clients addr_str
+      String.Table.remove Connection.active addr_str
     in
     Monitor.protect ~name:"server_fun" ~finally:cleanup (fun () ->
         Reader.(read_one_chunk_at_a_time r ~handle_chunk:(handle_chunk w 0))
@@ -1460,39 +1465,39 @@ let insert_instr buf_cs instrObj =
   let buf_cs = Cstruct.of_bigarray buf_cs ~len:SecurityDefinition.Response.sizeof_cs in
   let instrObj = RespObj.of_json instrObj in
   let key = RespObj.string_exn instrObj "symbol" in
-  let secdef = Instrument.to_secdef ~testnet:!use_testnet instrObj in
-  let instr = create_instr ~instrObj ~secdef () in
+  let secdef = Instrument.RespObj.to_secdef ~testnet:!use_testnet instrObj in
+  let instr = Instrument.create ~instrObj ~secdef () in
   let books = Int.Table.{ bids = create () ; asks = create () ; } in
-  String.Table.set instruments key instr;
+  String.Table.set Instrument.active key instr;
   String.Table.set orderbooks ~key ~data:books;
   Log.info log_bitmex "inserted instrument %s" key;
   (* Send secdef response to clients. *)
-  let on_client { addr; addr_str; w; subs; send_secdefs } =
+  let on_connection { Connection.addr; addr_str; w; subs; send_secdefs } =
     if send_secdefs then begin
       SecurityDefinition.Response.to_cstruct buf_cs { secdef with final = true; request_id = 110_000_000l };
       Writer.write_cstruct w buf_cs
     end
   in
-  String.Table.iter clients ~f:on_client
+  String.Table.iter Connection.active ~f:on_connection
 
 let update_instr buf_cs instrObj =
   let instrObj = RespObj.of_json instrObj in
   let symbol = RespObj.string_exn instrObj "symbol" in
-  match String.Table.find instruments symbol with
+  match String.Table.find Instrument.active symbol with
   | None ->
     Log.error log_bitmex "update_instr: unable to find %s" symbol;
   | Some instr ->
     instr.instrObj <- RespObj.merge instr.instrObj instrObj;
     Log.debug log_bitmex "updated instrument %s" symbol;
     (* Send messages to subscribed clients according to the type of update. *)
-    let on_client { addr; addr_str; w; subs; _ } =
+    let on_connection { Connection.addr; addr_str; w; subs; _ } =
       let on_symbol_id symbol_id =
         send_instr_update_msgs w buf_cs instrObj symbol_id;
         Log.debug log_dtc "-> [%s] instrument %s" addr_str symbol
       in
       Option.iter String.Table.(find subs symbol) ~f:on_symbol_id
     in
-    String.Table.iter clients ~f:on_client
+    String.Table.iter Connection.active ~f:on_connection
 
 let update_depths update_cs action { OrderBook.L2.symbol; id; side; size; price } =
   (* find_exn cannot raise here *)
@@ -1522,7 +1527,7 @@ let update_depths update_cs action { OrderBook.L2.symbol; id; side; size; price 
     | OB.Partial | Insert | Update -> Int.Table.set table id { size ; price }
     | Delete -> Int.Table.remove table id
     end;
-    let on_client { addr; addr_str; w; subs; subs_depth; _} =
+    let on_connection { Connection.addr; addr_str; w; subs; subs_depth; _} =
       let on_symbol_id symbol_id =
         (* Log.debug log_dtc "-> [%s] depth %s %s %s %f %d" addr_str (OB.sexp_of_action action |> Sexp.to_string) symbol side price size; *)
         MarketDepth.Update.write
@@ -1536,7 +1541,7 @@ let update_depths update_cs action { OrderBook.L2.symbol; id; side; size; price 
       in
       Option.iter String.Table.(find subs_depth symbol) ~f:on_symbol_id
     in
-    String.Table.iter clients ~f:on_client
+    String.Table.iter Connection.active ~f:on_connection
   | _ ->
     Log.info log_bitmex "update_depth: received update before snapshot, ignoring"
 
@@ -1549,7 +1554,7 @@ let update_quote update_cs q =
   let askSize = Option.value ~default:0 merged_q.askSize in
   String.Table.set quotes ~key:q.symbol ~data:merged_q;
   Log.debug log_bitmex "set quote %s" q.symbol;
-  let on_client { addr; addr_str; w; subs; subs_depth; _} =
+  let on_connection { Connection.addr; addr_str; w; subs; subs_depth; _} =
     let on_symbol_id symbol_id =
       Log.debug log_dtc "-> [%s] bidask %s %f %d %f %d"
         addr_str q.symbol bidPrice bidSize askPrice askSize;
@@ -1567,13 +1572,13 @@ let update_quote update_cs q =
     | Some id, None -> on_symbol_id id
     | _ -> ()
   in
-  String.Table.iter clients ~f:on_client
+  String.Table.iter Connection.active ~f:on_connection
 
 let update_trade cs { Trade.symbol; timestamp; price; size; side; tickDirection; trdMatchID;
                       grossValue; homeNotional; foreignNotional; id } =
   let open Trade in
   Log.debug log_bitmex "trade %s %s %f %d" symbol side price size;
-  match side_of_bmex side, String.Table.find instruments symbol with
+  match side_of_bmex side, String.Table.find Instrument.active symbol with
   | None, _ -> ()
   | _, None ->
     Log.error log_bitmex "update_trade: found no instrument for %s" symbol
@@ -1582,7 +1587,7 @@ let update_trade cs { Trade.symbol; timestamp; price; size; side; tickDirection;
     instr.last_trade_size <- size;
     instr.last_trade_ts <- Time_ns.of_string timestamp;
     (* Send trade updates to subscribers. *)
-    let on_client { addr; addr_str; w; subs; _} =
+    let on_connection { Connection.addr; addr_str; w; subs; _} =
       let on_symbol_id symbol_id =
         MarketData.UpdateTrade.write
           ~symbol_id
@@ -1596,7 +1601,7 @@ let update_trade cs { Trade.symbol; timestamp; price; size; side; tickDirection;
       in
       Option.iter String.Table.(find subs symbol) ~f:on_symbol_id
     in
-    String.Table.iter clients ~f:on_client
+    String.Table.iter Connection.active ~f:on_connection
 
 type bitmex_th = {
   th: unit Deferred.t ;
@@ -1700,7 +1705,7 @@ let bitmex_ws
   let connected = Mvar.create () in
   let rec resubscribe () =
     Mvar.take (Mvar.read_only connected) >>= fun () ->
-    String.Table.iter clients ~f:(fun c -> c.need_resubscribe <- true);
+    String.Table.iter Connection.active ~f:(fun c -> c.need_resubscribe <- true);
     Pipe.write to_ws_w @@ MD.to_yojson @@ MD.subscribe ~id:my_uuid ~topic:"" >>= fun () ->
     resubscribe ()
   in
@@ -1723,7 +1728,7 @@ let bitmex_ws
     Deferred.unit
   | Ok { MD.typ = Unsubscribe; id = stream_id; payload = None } ->
     let client_addr, user_id = addr_id_of_stream_id_exn stream_id in
-    begin match String.Table.find clients client_addr with
+    begin match String.Table.find Connection.active client_addr with
     | None ->
       Log.info log_bitmex "BitMEX unsubscribed stream for client %s, but client not in table" client_addr;
       Deferred.unit
@@ -1749,7 +1754,7 @@ let bitmex_ws
           on_update update;
           Deferred.unit
         end
-      | client_addr, userid -> begin match String.Table.find clients client_addr with
+      | client_addr, userid -> begin match String.Table.find Connection.active client_addr with
         | None ->
           Log.info log_bitmex "Got %s for %s, but client not in table"
             (Yojson.Safe.to_string payload) client_addr;
@@ -1778,7 +1783,7 @@ let bitmex_ws
             c.addr_str userid (Yojson.Safe.to_string payload);
           Deferred.unit
         | Update update ->
-          let client_update = { userid ; update } in
+          let client_update = { Connection.userid ; update } in
           Pipe.write c.ws_w client_update
         end
     end
@@ -1849,8 +1854,8 @@ let main
     Log.(set_output log_dtc Output.[stderr (); writer `Text log_writer]);
     Log.(set_output log_bitmex Output.[stderr (); writer `Text log_writer]);
     Log.(set_output log_ws Output.[stderr (); writer `Text log_writer]);
-    Util.conduit_server ~tls ~crt_path ~key_path >>= fun server ->
-    (Util.loop_log_errors ~log:log_dtc (fun () -> run ~server ~port)) >>= fun () ->
+    conduit_server ~tls ~crt_path ~key_path >>= fun server ->
+    loop_log_errors ~log:log_dtc (fun () -> run ~server ~port) >>= fun () ->
     Gc.full_major () ;
     Shutdown.exit 0
   end
