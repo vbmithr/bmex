@@ -448,18 +448,18 @@ let write_trade_accounts c w =
 
 let add_api_keys
     ({ addr_str; apikeys; usernames; accounts } : Connection.t)
-    ({ id; secret; permissions; enabled; userid } : Rest.ApiKey.entry) =
+    ({ id; secret; permissions; enabled; userId } : Rest.ApiKey.entry) =
   if enabled then begin
-    Int.Table.set apikeys ~key:userid ~data:{ key = id ; secret = (Cstruct.of_string secret) };
+    Int.Table.set apikeys ~key:userId ~data:{ key = id ; secret = (Cstruct.of_string secret) };
     let usernames' = List.filter_map permissions ~f:begin function
       | `Dtc username -> Some username
       | `Perm _ -> None
       end
     in
-    Int.Table.set usernames userid usernames';
+    Int.Table.set usernames userId usernames';
     List.iter usernames' ~f:begin fun u ->
-      String.Table.add_multi accounts u userid;
-      Log.debug log_bitmex "[%s] Add key for %s:%d" addr_str u userid
+      String.Table.add_multi accounts u userId;
+      Log.debug log_bitmex "[%s] Add key for %s:%d" addr_str u userId
     end
   end
 
