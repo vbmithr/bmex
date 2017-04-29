@@ -1,7 +1,5 @@
 all:
-	jbuilder build src/bmex.exe
-
-.PHONY: clean
+	jbuilder build @install @runtest
 
 clean:
 	rm -rf _build
