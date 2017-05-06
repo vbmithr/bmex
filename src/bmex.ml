@@ -130,8 +130,10 @@ module Instrument = struct
       let symbol = string_exn t "symbol" in
       let index = is_index symbol in
       let exchange =
-        string_exn t "reference"
-        ^ (if testnet && not index then "T" else "")
+        match index, testnet with
+        | true, _ -> string_exn t "reference"
+        | _, true -> "BMEXT"
+        | _ -> "BMEX"
       in
       let tickSize = float_exn t "tickSize" in
       let expiration_date = Option.map (string t "expiry") ~f:(fun time ->
