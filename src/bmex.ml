@@ -189,6 +189,7 @@ let log_dtc = Log.create ~level:`Error ~on_error:`Raise ~output:Log.Output.[stde
 let log_ws = Log.create ~level:`Error ~on_error:`Raise ~output:Log.Output.[stderr ()]
 
 let scratchbuf = Bigstring.create 4096
+let ws_feed_connected : unit Condition.t = Condition.create ()
 
 module Connection = struct
   type subscribe_msg =
@@ -1386,6 +1387,10 @@ let process addr w msg_cs scratchbuf =
 
 let dtcserver ~server ~port =
   let server_fun addr r w =
+    don't_wait_for begin
+      Condition.wait ws_feed_connected >>= fun () ->
+      Deferred.all_unit [Writer.close w ; Reader.close r]
+    end ;
     let addr_str = InetAddr.to_string addr in
     (* So that process does not allocate all the time. *)
     let rec handle_chunk w consumed buf ~pos ~len =
@@ -1707,6 +1712,7 @@ let bitmex_ws
   let connected = Mvar.create () in
   let rec resubscribe () =
     Mvar.take (Mvar.read_only connected) >>= fun () ->
+    Condition.broadcast ws_feed_connected () ;
     String.Table.iter Connection.active ~f:(fun c -> c.need_resubscribe <- true);
     Pipe.write to_ws_w @@ MD.to_yojson @@ MD.subscribe ~id:my_uuid ~topic:"" >>= fun () ->
     resubscribe ()
@@ -1799,13 +1805,6 @@ let bitmex_ws
       (fun exn -> Log.error log_bitmex "%s" @@ Exn.to_string exn) in
   { th ; ws }
 
-let terminate terminate_bitmex dtc_server bitmex_th =
-  terminate_bitmex () ;
-  Deferred.all_unit [
-    Tcp.Server.close ~close_existing_connections:true dtc_server ;
-    (close_bitmex_ws bitmex_th ; bitmex_th.th)
-  ]
-
 let main
     tls testnet port daemon
     pidfile logfile loglevel
@@ -1813,7 +1812,6 @@ let main
   let pidfile = if testnet then add_suffix pidfile "_testnet" else pidfile in
   let logfile = if testnet then add_suffix logfile "_testnet" else logfile in
   let run ~server ~port =
-    (* let interrupt = Ivar.create () in *)
     let instrs_initialized = Ivar.create () in
     let orderbook_initialized = Ivar.create () in
     let quotes_initialized = Ivar.create () in
@@ -1825,14 +1823,6 @@ let main
       [instrs_initialized; orderbook_initialized; quotes_initialized] >>= fun () ->
     dtcserver ~server ~port >>= fun dtc_server ->
     Log.info log_dtc "DTC server started";
-    (* Option.iter timeout ~f:begin fun duration -> *)
-    (*     don't_wait_for begin *)
-    (*       Clock_ns.after (Time_ns.Span.of_int_sec duration) >>= fun () -> *)
-    (*       let terminate_bitmex = Ivar.fill_if_empty interrupt in *)
-    (*       terminate terminate_bitmex dtc_server bitmex_th  >>| fun () -> *)
-    (*       Log.info log_dtc "All servers terminated" *)
-    (*     end *)
-    (* end ; *)
     Deferred.all_unit [Tcp.Server.close_finished dtc_server; bitmex_th.th]
   in
 
