@@ -1,5 +1,5 @@
 (executable
- ((name bmex)
-  (public_name bmex)
-  (preprocess (pps (ppx_sexp_conv)))
-  (libraries (uuidm dtc bs-api))))
+ ((name bitmex_prod)
+  (public_name bitmex-prod)
+  (preprocess (pps (ppx_sexp_conv ppx_hash ppx_compare)))
+  (libraries (dtc-pb bmex-rest bmex-ws))))
