@@ -1682,9 +1682,12 @@ let unsubscribe_client ?(topic="") ~uuid ~addr ~id () =
   let id = stream_id ~uuid ~addr ~id in
   Bmex_ws.MD.(unsubscribe ~id ~topic |> to_yojson)
 
-let addr_id_of_stream_id_exn stream_id =
+let conn_userid_of_stream_id_exn stream_id =
   match String.split ~on:'|' stream_id with
-  | [_; client_addr; userid] -> Some (client_addr, Int.of_string userid)
+  | [_; addr; userid] ->
+      Option.map (Connection.find addr) ~f:begin fun conn ->
+        conn, Int.of_string userid
+      end
   | _ -> None
 
 let bitmex_topics = Bmex_ws.Topic.[Instrument; Quote; OrderBookL2; Trade]
@@ -1693,21 +1696,18 @@ let clients_topics = Bmex_ws.Topic.[Order; Execution; Position; Margin]
 let on_ws_msg to_ws_w my_uuid msg =
   let open Bmex_ws in
   match MD.of_yojson msg with
+  | Subscribe _ -> ()
   | Unsubscribe { id ; topic } -> begin
-      let open Option in
-      match
-        (addr_id_of_stream_id_exn id) >>= fun (client_addr, user_id) ->
-        Connection.find client_addr >>| fun { Connection.to_client_w } ->
-        client_addr, user_id, to_client_w
-      with
+      match conn_userid_of_stream_id_exn id with
       | None ->
           Log.info log_bitmex
             "Got Unsubscribe message from client not in table"
-      | Some (addr, id, to_client_w) ->
-          Pipe.write_without_pushback to_client_w @@ Unsubscribe { addr ; id }
+      | Some (conn, id) ->
+          Pipe.write_without_pushback conn.to_client_w
+            (Unsubscribe { addr = conn.addr ; id })
     end
-  | Message { stream = { id ; topic } ; payload } ->
-      match Response.of_yojson payload, addr_id_of_stream_id_exn id with
+  | Message { stream = { id ; topic } ; payload } -> begin
+      match Response.of_yojson payload, conn_userid_of_stream_id_exn id with
       (* Server *)
       | Response.Welcome _, None ->
           Pipe.write_without_pushback to_ws_w @@
@@ -1722,44 +1722,31 @@ let on_ws_msg to_ws_w my_uuid msg =
             "BitMEX: subscribed to %s" (Topic.show topic)
       | Update update, None -> on_update update
 
-        end
-      | Some (client_addr, userid) -> begin
-          match Connection.find client_addr with
-          | None ->
-              Log.info log_bitmex "Got %s for %s, but client not in table"
-                (Yojson.Safe.to_string payload) client_addr;
-              Deferred.unit
-          | Some c -> match Ws.msg_of_yojson payload with
-          (* Clients *)
-          | Welcome ->
-              with_userid c ~userid ~f:begin fun ~addr_str:_ ~userid ~username ~key ~secret ->
-                Pipe.write_without_pushback to_ws_w @@ MD.to_yojson @@ MD.auth ~id:stream_id ~topic:"" ~key ~secret
-              end;
-              Deferred.unit
-          | Error msg ->
-              Log.error log_bitmex "[%s] %d: error %s" c.addr_str userid (show_error msg);
-              Deferred.unit
-          | Ok { request = { op = "authKey"}; success} ->
-              Log.debug log_bitmex "[%s] %d: subscribe to topics" c.addr_str userid;
-              Deferred.all_unit [
-                Pipe.write to_ws_w @@ MD.to_yojson @@ subscribe_topics stream_id clients_topics;
-                Pipe.write c.to_client_w @@ Subscribe { addr=client_addr; id=userid }
-              ]
-          | Ok { request = { op = "subscribe"}; subscribe; success} ->
-              Log.info log_bitmex "[%s] %d: subscribed to %s: %b" c.addr_str userid subscribe success;
-              Deferred.unit
-          | Ok { success } ->
-              Log.error log_bitmex "[%s] %d: unexpected response %s"
-                c.addr_str userid (Yojson.Safe.to_string payload);
-              Deferred.unit
-          | Update update ->
-              let client_update = { Connection.userid ; update } in
-              Pipe.write c.ws_w client_update
-        end
-end
-  | _ ->
-      Log.error log_bitmex "BitMEX: unexpected multiplexed packet format";
-      Deferred.unit
+      (* Clients *)
+      | Welcome _, Some (conn, userid) ->
+          with_userid conn ~userid ~f:begin fun ~addr:_ ~userid ~username ~key ~secret ->
+            Pipe.write_without_pushback to_ws_w @@
+            MD.(auth ~id ~topic:"" ~key ~secret |> to_yojson)
+          end
+      | Error err, Some (conn, userid) ->
+          Log.error log_bitmex "[%s] %d: error %s" conn.addr userid err ;
+      | Response { request = AuthKey _ ; success}, Some (conn, userid) ->
+          Log.debug log_bitmex "[%s] %d: subscribe to topics" conn.addr userid;
+          Pipe.write_without_pushback to_ws_w @@
+            MD.to_yojson @@ subscribe_topics id clients_topics ;
+          Pipe.write_without_pushback conn.to_client_w @@
+          Subscribe { addr = conn.addr ; id = userid }
+      | Response { subscribe = Some { topic = subscription } }, Some (conn, userid) ->
+          Log.info log_bitmex "[%s] %d: subscribed to %s"
+            conn.addr userid (Topic.show subscription)
+      | Response _, Some (conn, userid) ->
+          Log.error log_bitmex "[%s] %d: unexpected response %s"
+            conn.addr userid (Yojson.Safe.to_string payload)
+      | Update update, Some (conn, userid) ->
+          let client_update = { Connection.userid ; update } in
+          Pipe.write_without_pushback conn.ws_w client_update
+      | _ -> ()
+    end
 
 let bitmex_ws
     ~instrs_initialized ~orderbook_initialized ~quotes_initialized =
@@ -1800,7 +1787,8 @@ let bitmex_ws
       ~testnet:!use_testnet ~md:true ~topics:[] () in
   let th =
     Monitor.handle_errors
-      (fun () -> Pipe.iter ~continue_on_error:true ws ~f:on_ws_msg)
+      (fun () -> Pipe.iter_without_pushback
+          ~continue_on_error:true ws ~f:(on_ws_msg to_ws_w my_uuid))
       (fun exn -> Log.error log_bitmex "%s" @@ Exn.to_string exn) in
   { th ; ws }
 
@@ -1847,7 +1835,6 @@ let main
     Log.(set_output log_ws Output.[stderr (); writer `Text log_writer]);
     conduit_server ~tls ~crt_path ~key_path >>= fun server ->
     loop_log_errors ~log:log_dtc (fun () -> run ~server ~port) >>= fun () ->
-    Gc.full_major () ;
     Shutdown.exit 0
   end
 
