@@ -364,15 +364,15 @@ module Instrument = struct
 end
 
 module Order = struct
-  exception Found of int * RespObj.t
+  exception Found of Uuid.t * int * RespObj.t
   let find order uuid = try
     Int.Table.iteri order ~f:begin fun ~key ~data ->
       match Uuid.Table.find data uuid with
-      | Some o -> raise (Found (key, o))
+      | Some o -> raise (Found (uuid, key, o))
       | None -> ()
     end;
     None
-  with Found (account, o) -> Some (account, o)
+  with Found (uuid, account, o) -> Some (uuid, account, o)
 end
 
 module Quotes = struct
@@ -825,8 +825,9 @@ let reject_logon_request addr w k =
     write_message w `logon_response DTC.gen_logon_response r
   end k
 
-let logon_request addr w (req : DTC.Logon_request.t) =
+let logon_request addr w msg =
   Log.debug log_dtc "<- [%s] Logon Request" addr ;
+  let req = DTC.parse_logon_request msg in
   let int1 = Option.value ~default:0l req.integer_1 in
   let send_secdefs = Int32.(bit_and int1 128l <> 0l) in
   match req.username, req.password with
@@ -1090,7 +1091,7 @@ let get_open_orders ?user_id ?order_id order_table =
   | None, Some order_id ->
       begin match Order.find order_table order_id with
       | None -> raise No_such_order
-      | Some (uid, o) ->
+      | Some (_uuid, uid, o) ->
           match order_is_open o with Some status -> [status, o] | None -> []
       end
 
@@ -1209,35 +1210,6 @@ let send_historical_order_fills_response req addr w orders =
   end ;
   Log.debug log_dtc "-> [%s] Historical Order Fills Response %d" addr nb_msgs
 
-(* let process = function *)
-(* | [] -> *)
-(*     Response.write ~nb_msgs:1 ~msg_number:1 ~request_id:m.Request.id ~no_order_fills:true response_cs; *)
-(*     Writer.write_cstruct w response_cs *)
-(* | fills -> *)
-(*     let nb_msgs = List.length fills in *)
-(*     List.iteri fills ~f:begin fun i o -> *)
-(*       let o = RespObj.of_json o in *)
-(*       let userid = RespObj.int_exn o "account" in *)
-(*       with_userid c ~userid ~f:begin fun ~addr_str:_ ~userid ~username ~key:_ ~secret:_ -> *)
-(*         Response.write *)
-(*           ~nb_msgs *)
-(*           ~msg_number:(succ i) *)
-(*           ~request_id:m.Request.id *)
-(*           ~symbol:RespObj.(string_exn o "symbol") *)
-(*           ~exchange:!my_exchange *)
-(*           ~srv_order_id:RespObj.(string_exn o "orderID" |> b64_of_uuid) *)
-(*           ~p:RespObj.(float_exn o "avgPx") *)
-(*           ~v:Float.(of_int64 RespObj.(int64_exn o "orderQty")) *)
-(*           ~ts:(RespObj.string_exn o "transactTime" |> Time_ns.of_string) *)
-(*           ?side:(RespObj.string_exn o "side" |> side_of_bmex) *)
-(*           ~exec_id:RespObj.(string_exn o "execID" |> b64_of_uuid) *)
-(*           ~trade_account:(trade_accountf ~userid ~username) *)
-(*           response_cs; *)
-(*         Writer.write_cstruct w response_cs *)
-(*       end *)
-(*     end; *)
-(*     Log.debug log_dtc "-> [%s] HistOrdFillsResp %d" addr_str nb_msgs *)
-
 let reject_historical_order_fills_request ?request_id w k =
   let rej = DTC.default_historical_order_fills_reject () in
   rej.request_id <- request_id ;
@@ -1281,14 +1253,6 @@ let historical_order_fills_request addr w msg =
     Log.debug log_dtc "<- [%s] Historical Order Fills Request" addr ;
     let req = DTC.parse_historical_order_fills_request msg in
     let trade_account = Option.value ~default:"" req.trade_account in
-    (* let get_all_fills ~key ~secret = *)
-    (*   Rest.call ~name:"execution" ~f:begin fun uri -> *)
-    (*     Client.get ~headers:(Rest.mk_headers ~key ~secret `GET uri) uri *)
-    (*   end uri >>| function *)
-    (*   | Ok (`List orders) -> orders *)
-    (*   | Ok json -> Log.error log_bitmex "%s" @@ Yojson.Safe.to_string json; [] *)
-    (*   | Error err -> Log.error log_bitmex "%s" @@ Error.to_string_hum err; [] *)
-    (* in *)
     match Option.map (cut_trade_account trade_account) ~f:snd with
     | None -> don't_wait_for begin
         Monitor.try_with_or_error begin fun () ->
@@ -1498,81 +1462,60 @@ let cancel_replace_order addr w msg =
   let time_in_force = Option.value ~default:`tif_unset req.time_in_force in
   if order_type <> `order_type_unset then
     reject_cancel_replace_order req addr w
-      "Modification of order type is not supported by BitMEX"
+      "Modification of ordType is not supported by BitMEX"
   else if time_in_force <> `tif_unset then
     reject_cancel_replace_order req addr w
-      "Modification of time in force is not supported by BitMEX"
-  else match req.server_order_id with
+      "Modification of timeInForce is not supported by BitMEX"
+  else
+  match Option.bind req.server_order_id ~f:begin fun orderID ->
+          Order.find order (Uuid.of_string orderID)
+        end with
   | None ->
-      reject_cancel_replace_order req addr w
-        "No server order id set"
-  | Some orderID ->
-      match Order.find order (Uuid.of_string orderID) with
-      | None ->
-          Log.error log_bitmex "CancelReplace: cannot find order %s" orderID ;
-          reject_cancel_replace_order req addr w
-            "internal error: order id %s not found in db" orderID
-      | Some (userid, o) ->
-          let ordType = RespObj.string_exn o "ordType" |> OrderType.of_string in
-          with_userid conn ~userid ~f:begin fun ~addr ~userid ~username ~key ~secret ->
-            don't_wait_for (amend_order addr w req key secret orderID ordType)
-          end
-
-  | Some CancelOrder ->
-    let open Trading.Order in
-    let ({ Connection.addr_str; order } as c) = Option.value_exn conn in
-    let { Cancel.srv_ord_id; cli_ord_id } = Cancel.read msg_cs in
-    let reject ~userid ~username k =
-      let trade_account = trade_accountf ~userid ~username in
-      let order_update_cs = Cstruct.of_bigarray ~off:0 ~len:Update.sizeof_cs scratchbuf in
-      Printf.ksprintf begin fun reason ->
-        Update.write
-          ~nb_msgs:1
-          ~msg_number:1
-          ~reason:Cancel_rejected
-          ~cli_ord_id
-          ~srv_ord_id
-          ~trade_account
-          ~info_text:reason
-          order_update_cs;
-        Writer.write_cstruct w order_update_cs;
-        Log.debug log_dtc "-> [%s] CancelOrderRej: %s" addr_str reason
-      end k
-    in
-    let hex_srv_ord_id = uuid_of_b64 srv_ord_id in
-    let { Connection.addr_str } = Option.value_exn conn in
-    Log.debug log_dtc "<- [%s] Cancelorder cli=%s srv=%s" addr_str cli_ord_id hex_srv_ord_id;
-
-    let cancel_order ~userid ~username ~key ~secret hex_srv_ord_id =
-      let uri = Uri.with_path !base_uri "/api/v1/order" in
-      let body_str = `Assoc ["orderID", `String hex_srv_ord_id] |> Yojson.Safe.to_string in
-      let body = Body.of_string body_str in
-      Rest.call ~extract_exn:true ~name:"cancel" ~f:begin fun uri ->
-        Client.delete
-          ~chunked:false ~body
-          ~headers:(Rest.mk_headers ~key ~secret ~data:body_str `DELETE uri) uri
-      end uri >>| function
-      | Ok body ->
-        Log.debug log_bitmex "<- %s" @@ Yojson.Safe.to_string body
-      | Error err ->
-        let msg = match Error.to_exn err with Failure msg -> msg | exn -> Exn.to_string_mach exn in
-        reject ~userid ~username "%s" msg;
-        Log.error log_bitmex "%s" msg
-    in
-    begin match Order.find order (Uuid.of_string hex_srv_ord_id) with
-    | None ->
-      Log.error log_bitmex "Cancel: cannot find order, SC will not be notified"
-    | Some (userid, o) ->
-      with_userid c ~userid ~f:begin fun ~addr_str:_ ~userid ~username ~key ~secret ->
-        don't_wait_for @@ cancel_order ~userid ~username ~key ~secret hex_srv_ord_id
+      Log.error log_bitmex "Order Cancel Replace: Order Not Found" ;
+      reject_cancel_replace_order req addr w "Order Not Found"
+  | Some (orderID, userid, o) ->
+      let ordType = RespObj.string_exn o "ordType" |> OrderType.of_string in
+      with_userid conn ~userid ~f:begin fun ~addr ~userid ~username ~key ~secret ->
+        don't_wait_for (amend_order addr w req key secret orderID ordType)
       end
-    end
 
-  | Some _
-  | None ->
-    let buf = Buffer.create 128 in
-    Cstruct.hexdump_to_buffer buf msg_cs;
-    Log.error log_dtc "%s" @@ Buffer.contents buf
+let reject_cancel_order (req : DTC.Cancel_order.t) addr w k =
+  let rej = DTC.default_order_update () in
+  rej.total_num_messages <- Some 1l ;
+  rej.message_number <- Some 1l ;
+  rej.order_update_reason <- Some `order_cancel_rejected ;
+  rej.client_order_id <- req.client_order_id ;
+  rej.server_order_id <- req.server_order_id ;
+  Printf.ksprintf begin fun info_text ->
+    rej.info_text <- Some info_text ;
+    write_message w `order_update DTC.gen_order_update rej ;
+    Log.debug log_dtc "-> [%s] Cancel Rejected: %s" addr info_text
+  end k
+
+let cancel_order req addr w key secret orderID =
+  REST.Order.cancel
+    ~log:log_bitmex ~testnet:!use_testnet ~key ~secret ~orderIDs:[orderID] () >>| function
+  | Ok (_resp, body) ->
+    Log.debug log_bitmex "<- %s" @@ Yojson.Safe.to_string body
+  | Error err ->
+    let err_str = Error.to_string_hum err in
+    reject_cancel_order req addr w "%s" err_str;
+    Log.error log_bitmex "%s" err_str
+
+let cancel_order addr w msg =
+    let ({ Connection.addr ; order } as conn) = Connection.find_exn addr in
+    Log.debug log_dtc "<- [%s] Cancel Order" addr ;
+    let req = DTC.parse_cancel_order msg in
+    match Option.bind req.server_order_id ~f:begin fun orderID ->
+      Order.find order (Uuid.of_string orderID)
+    end with
+    | None ->
+        Log.error log_bitmex "Order Cancel: Order Not Found" ;
+        reject_cancel_order req addr w "Order Not Found"
+    | Some (orderID, userid, o) ->
+      with_userid conn ~userid ~f:begin fun ~addr:_ ~userid ~username ~key ~secret ->
+        don't_wait_for @@ cancel_order req addr w key secret orderID
+      end
 
 let dtcserver ~server ~port =
   let server_fun addr r w =
@@ -1616,12 +1559,18 @@ let dtcserver ~server ~port =
         end
     in
     let on_connection_io_error exn =
-      String.Table.remove Connection.active addr ;
+      Connection.remove addr ;
       Log.error log_dtc "on_connection_io_error (%s): %s" addr Exn.(to_string exn)
     in
     let cleanup () =
       Log.info log_dtc "client %s disconnected" addr ;
-      String.Table.remove Connection.active addr ;
+      begin match Connection.find addr with
+      | None -> Deferred.unit
+      | Some conn ->
+          Connection.purge conn ;
+          Pipe.write client_deleted_w conn
+      end >>= fun () ->
+      Connection.remove addr ;
       Deferred.all_unit [Writer.close w; Reader.close r]
     in
     Deferred.ignore @@ Monitor.protect ~finally:cleanup begin fun () ->
@@ -1637,109 +1586,38 @@ let dtcserver ~server ~port =
     ~on_handler_error:(`Call on_handler_error_f)
     server (Tcp.on_port port) server_fun
 
-let update_depths update_cs action { OrderBook.L2.symbol; id; side; size; price } =
-  (* find_exn cannot raise here *)
-  let { bids; asks } =  String.Table.find_exn orderbooks symbol in
-  let side = side_of_bmex side in
-  let table = match side with
-  | Some `Buy -> bids
-  | Some `Sell -> asks
-  | None -> failwith "update_depth: empty side" in
-  let price = match price with
-  | Some p -> Some p
-  | None -> begin match Int.Table.find table id with
-    | Some { price } -> Some price
-    | None -> None
-    end
-  in
-  let size = match size with
-  | Some s -> Some s
-  | None -> begin match Int.Table.find table id with
-    | Some { size } -> Some size
-    | None -> None
-    end
-  in
-  match price, size with
-  | Some price, Some size ->
-    begin match action with
-    | OB.Partial | Insert | Update -> Int.Table.set table id { size ; price }
-    | Delete -> Int.Table.remove table id
-    end;
-    let on_connection { Connection.addr; addr_str; w; subs; subs_depth; _} =
-      let on_symbol_id symbol_id =
-        (* Log.debug log_dtc "-> [%s] depth %s %s %s %f %d" addr_str (OB.sexp_of_action action |> Sexp.to_string) symbol side price size; *)
-        MarketDepth.Update.write
-          ~op:(match action with Partial | Insert | Update -> `Insert_update | Delete -> `Delete)
-          ~p:price
-          ~v:(Float.of_int size)
-          ~symbol_id
-          ?side
-          update_cs;
-        Writer.write_cstruct w update_cs
-      in
-      Option.iter String.Table.(find subs_depth symbol) ~f:on_symbol_id
-    in
-    String.Table.iter Connection.active ~f:on_connection
-  | _ ->
-    Log.info log_bitmex "update_depth: received update before snapshot, ignoring"
-
-let update_quote update_cs q =
-  let old_q = String.Table.find_or_add quotes q.Quote.symbol ~default:(fun () -> q) in
-  let merged_q = Quote.merge old_q q in
-  let bidPrice = Option.value ~default:Float.max_finite_value merged_q.bidPrice in
-  let bidSize = Option.value ~default:0 merged_q.bidSize in
-  let askPrice = Option.value ~default:Float.max_finite_value merged_q.askPrice in
-  let askSize = Option.value ~default:0 merged_q.askSize in
-  String.Table.set quotes ~key:q.symbol ~data:merged_q;
-  Log.debug log_bitmex "set quote %s" q.symbol;
-  let on_connection { Connection.addr; addr_str; w; subs; subs_depth; _} =
-    let on_symbol_id symbol_id =
-      Log.debug log_dtc "-> [%s] bidask %s %f %d %f %d"
-        addr_str q.symbol bidPrice bidSize askPrice askSize;
-      MarketData.UpdateBidAsk.write
-        ~symbol_id
-        ~bid:bidPrice
-        ~bid_qty:Float.(of_int bidSize)
-        ~ask:askPrice
-        ~ask_qty:Float.(of_int askSize)
-        ~ts:(Time_ns.of_string merged_q.timestamp)
-        update_cs;
-      Writer.write_cstruct w update_cs
-    in
-    match String.Table.(find subs q.symbol, find subs_depth q.symbol) with
-    | Some id, None -> on_symbol_id id
-    | _ -> ()
-  in
-  String.Table.iter Connection.active ~f:on_connection
-
-let update_trade cs { Trade.symbol; timestamp; price; size; side; tickDirection; trdMatchID;
-                      grossValue; homeNotional; foreignNotional; id } =
-  let open Trade in
-  Log.debug log_bitmex "trade %s %s %f %d" symbol side price size;
-  match side_of_bmex side, String.Table.find Instrument.active symbol with
-  | None, _ -> ()
+let update_trade { Trade.symbol; timestamp; price; size; side } =
+  Log.debug log_bitmex "trade %s %s %f %d" symbol (Side.show side) price size;
+  match side, Instrument.find symbol with
+  | `buy_sell_unset, _ -> ()
   | _, None ->
     Log.error log_bitmex "update_trade: found no instrument for %s" symbol
-  | Some s, Some instr ->
+  | _, Some instr ->
     instr.last_trade_price <- price;
     instr.last_trade_size <- size;
-    instr.last_trade_ts <- Time_ns.of_string timestamp;
+    instr.last_trade_ts <- timestamp;
     (* Send trade updates to subscribers. *)
-    let on_connection { Connection.addr; addr_str; w; subs; _} =
+    let at_bid_or_ask =
+      match side with
+      | `buy -> `at_bid
+      | `sell -> `at_ask
+      | `buy_sell_unset -> `bid_ask_unset in
+    let u = DTC.default_market_data_update_trade () in
+    u.at_bid_or_ask <- Some at_bid_or_ask ;
+    u.price <- Some price ;
+    u.volume <- Some (Int.to_float size) ;
+    u.date_time <- Some (float_of_ts timestamp) ;
+    let on_connection { Connection.addr; w; subs } =
       let on_symbol_id symbol_id =
-        MarketData.UpdateTrade.write
-          ~symbol_id
-          ~side:s
-          ~p:price
-          ~v:(Int.to_float size)
-          ~ts:(Time_ns.of_string timestamp)
-          cs;
-        Writer.write_cstruct w cs;
-        Log.debug log_dtc "-> [%s] trade %s %s %f %d" addr_str symbol side price size
+        u.symbol_id <- Some symbol_id ;
+        write_message w `market_data_update_trade
+          DTC.gen_market_data_update_trade u ;
+        Log.debug log_dtc "-> [%s] trade %s %s %f %d"
+          addr symbol (Side.show side) price size
       in
       Option.iter String.Table.(find subs symbol) ~f:on_symbol_id
     in
-    String.Table.iter Connection.active ~f:on_connection
+    Connection.iter ~f:on_connection
 
 type bitmex_th = {
   th: unit Deferred.t ;
@@ -1748,188 +1626,178 @@ type bitmex_th = {
 
 let close_bitmex_ws { ws } = Pipe.close_read ws
 
-let bitmex_ws
-    ~instrs_initialized ~orderbook_initialized ~quotes_initialized =
-  let open Ws in
-  let buf_cs = Bigstring.create 4096 in
-  let trade_update_cs = Cstruct.of_bigarray ~len:MarketData.UpdateTrade.sizeof_cs buf_cs in
-  let depth_update_cs = Cstruct.of_bigarray ~len:MarketDepth.Update.sizeof_cs buf_cs in
-  let bidask_update_cs = Cstruct.of_bigarray ~len:MarketData.UpdateBidAsk.sizeof_cs buf_cs in
-  let on_update update =
-    let action = update_action_of_string update.action in
-    match action, update.table, update.data with
-    | Update, "instrument", instrs ->
-      if Ivar.is_full instrs_initialized then List.iter instrs ~f:(update_instr buf_cs)
-    | Delete, "instrument", instrs ->
-      if Ivar.is_full instrs_initialized then List.iter instrs ~f:delete_instr
-    | _, "instrument", instrs ->
-      List.iter instrs ~f:(insert_instr buf_cs);
-      Ivar.fill_if_empty instrs_initialized ()
-    | _, "orderBookL2", depths ->
-      let filter_f json = match OrderBook.L2.of_yojson json with
-      | Ok u -> Some u
-      | Error reason ->
-        Log.error log_bitmex "%s: %s (%s)"
-          reason Yojson.Safe.(to_string json) update.action;
-        None
-      in
-      let depths = List.filter_map depths ~f:filter_f in
-      let depths = List.group depths
-          ~break:(fun { symbol } { symbol=symbol' } -> symbol <> symbol')
-      in
-      don't_wait_for begin
-        Ivar.read instrs_initialized >>| fun () ->
-        List.iter depths ~f:begin function
+let on_update { Bmex_ws.Response.Update.table ; action ; data } =
+  match action, table, data with
+  | Update, "instrument", instrs ->
+    if Ivar.is_full Instrument.initialized then
+      List.iter instrs ~f:Instrument.update
+  | Delete, "instrument", instrs ->
+    if Ivar.is_full Instrument.initialized then
+      List.iter instrs ~f:Instrument.delete
+  | _, "instrument", instrs ->
+    List.iter instrs ~f:Instrument.insert ;
+    Ivar.fill_if_empty Instrument.initialized ()
+  | _, "orderBookL2", depths ->
+    let depths = List.map depths ~f:OrderBook.L2.of_yojson in
+    let depths = List.group depths
+        ~break:(fun { symbol } { symbol=symbol' } -> symbol <> symbol')
+    in
+    don't_wait_for begin
+      Ivar.read Instrument.initialized >>| fun () ->
+      List.iter depths ~f:begin function
         | [] -> ()
         | h::t as ds ->
           Log.debug log_bitmex "depth update %s" h.symbol;
-          List.iter ds ~f:(update_depths depth_update_cs action)
-        end;
-        Ivar.fill_if_empty orderbook_initialized ()
-      end
-    | _, "trade", trades ->
-      let open Trade in
-      let iter_f t = match Trade.of_yojson t with
-      | Error msg ->
-        Log.error log_bitmex "%s" msg
-      | Ok t -> update_trade trade_update_cs t
-      in
-      don't_wait_for begin
-        Ivar.read instrs_initialized >>| fun () ->
-        List.iter trades ~f:iter_f
-      end
-    | _, "quote", quotes ->
-      let filter_f json =
-        match Quote.of_yojson json with
-        | Ok q -> Some q
-        | Error reason ->
-          Log.error log_bitmex "%s: %s (%s)"
-            reason Yojson.Safe.(to_string json) update.action;
-          None
-      in
-      let quotes = List.filter_map quotes ~f:filter_f in
-      List.iter quotes ~f:(update_quote bidask_update_cs);
-      Ivar.fill_if_empty quotes_initialized ()
-    | _, table, json ->
-      Log.error log_bitmex "Unknown/ignored BitMEX DB table %s or wrong json %s"
-        table Yojson.Safe.(to_string @@ `List json)
-  in
+          List.iter ds ~f:(Books.update action)
+      end;
+      Ivar.fill_if_empty Books.initialized ()
+    end
+  | _, "trade", trades ->
+    let open Trade in
+    don't_wait_for begin
+      Ivar.read Instrument.initialized >>| fun () ->
+      List.iter trades ~f:(Fn.compose update_trade Trade.of_yojson)
+    end
+  | _, "quote", quotes ->
+    List.iter quotes ~f:(Fn.compose Quotes.update Quote.of_yojson) ;
+    Ivar.fill_if_empty Quotes.initialized ()
+  | _, table, json ->
+    Log.error log_bitmex "Unknown/ignored BitMEX DB table %s or wrong json %s"
+      table Yojson.Safe.(to_string @@ `List json)
+
+let subscribe_topics ?(topic="") ~id ~topics =
+  let open Bmex_ws in
+  let payload =
+    Request.(subscribe (List.map topics ~f:Sub.create) |> to_yojson) in
+  Bmex_ws.MD.message id topic payload
+
+let stream_id ~uuid ~addr ~id =
+  uuid ^ "|" ^ addr ^ "|" ^ Int.to_string id
+
+let subscribe_client ?(topic="") ~uuid ~addr ~id () =
+  let id = stream_id ~uuid ~addr ~id in
+  Bmex_ws.MD.(subscribe ~id ~topic |> to_yojson)
+
+let unsubscribe_client ?(topic="") ~uuid ~addr ~id () =
+  let id = stream_id ~uuid ~addr ~id in
+  Bmex_ws.MD.(unsubscribe ~id ~topic |> to_yojson)
+
+let addr_id_of_stream_id_exn stream_id =
+  match String.split ~on:'|' stream_id with
+  | [_; client_addr; userid] -> Some (client_addr, Int.of_string userid)
+  | _ -> None
+
+let bitmex_topics = Bmex_ws.Topic.[Instrument; Quote; OrderBookL2; Trade]
+let clients_topics = Bmex_ws.Topic.[Order; Execution; Position; Margin]
+
+let on_ws_msg to_ws_w my_uuid msg =
+  let open Bmex_ws in
+  match MD.of_yojson msg with
+  | Unsubscribe { id ; topic } -> begin
+      let open Option in
+      match
+        (addr_id_of_stream_id_exn id) >>= fun (client_addr, user_id) ->
+        Connection.find client_addr >>| fun { Connection.to_client_w } ->
+        client_addr, user_id, to_client_w
+      with
+      | None ->
+          Log.info log_bitmex
+            "Got Unsubscribe message from client not in table"
+      | Some (addr, id, to_client_w) ->
+          Pipe.write_without_pushback to_client_w @@ Unsubscribe { addr ; id }
+    end
+  | Message { stream = { id ; topic } ; payload } ->
+      match Response.of_yojson payload, addr_id_of_stream_id_exn id with
+      (* Server *)
+      | Response.Welcome _, None ->
+          Pipe.write_without_pushback to_ws_w @@
+          MD.to_yojson @@ subscribe_topics my_uuid bitmex_topics
+      | Error err, None ->
+          Log.error log_bitmex "BitMEX: error %s" err
+      | Response { subscribe = Some { topic ; symbol = Some sym } }, None ->
+          Log.info log_bitmex
+            "BitMEX: subscribed to %s:%s" (Topic.show topic) sym
+      | Response { subscribe = Some { topic; symbol = None }}, None ->
+          Log.info log_bitmex
+            "BitMEX: subscribed to %s" (Topic.show topic)
+      | Update update, None -> on_update update
+
+        end
+      | Some (client_addr, userid) -> begin
+          match Connection.find client_addr with
+          | None ->
+              Log.info log_bitmex "Got %s for %s, but client not in table"
+                (Yojson.Safe.to_string payload) client_addr;
+              Deferred.unit
+          | Some c -> match Ws.msg_of_yojson payload with
+          (* Clients *)
+          | Welcome ->
+              with_userid c ~userid ~f:begin fun ~addr_str:_ ~userid ~username ~key ~secret ->
+                Pipe.write_without_pushback to_ws_w @@ MD.to_yojson @@ MD.auth ~id:stream_id ~topic:"" ~key ~secret
+              end;
+              Deferred.unit
+          | Error msg ->
+              Log.error log_bitmex "[%s] %d: error %s" c.addr_str userid (show_error msg);
+              Deferred.unit
+          | Ok { request = { op = "authKey"}; success} ->
+              Log.debug log_bitmex "[%s] %d: subscribe to topics" c.addr_str userid;
+              Deferred.all_unit [
+                Pipe.write to_ws_w @@ MD.to_yojson @@ subscribe_topics stream_id clients_topics;
+                Pipe.write c.to_client_w @@ Subscribe { addr=client_addr; id=userid }
+              ]
+          | Ok { request = { op = "subscribe"}; subscribe; success} ->
+              Log.info log_bitmex "[%s] %d: subscribed to %s: %b" c.addr_str userid subscribe success;
+              Deferred.unit
+          | Ok { success } ->
+              Log.error log_bitmex "[%s] %d: unexpected response %s"
+                c.addr_str userid (Yojson.Safe.to_string payload);
+              Deferred.unit
+          | Update update ->
+              let client_update = { Connection.userid ; update } in
+              Pipe.write c.ws_w client_update
+        end
+end
+  | _ ->
+      Log.error log_bitmex "BitMEX: unexpected multiplexed packet format";
+      Deferred.unit
+
+let bitmex_ws
+    ~instrs_initialized ~orderbook_initialized ~quotes_initialized =
+  let open Bmex_ws in
   let to_ws, to_ws_w = Pipe.create () in
-  let bitmex_topics = ["instrument"; "quote"; "orderBookL2"; "trade"] in
-  let clients_topics = ["order"; "execution"; "position"; "margin"] in
-  let subscribe_topics ?(topic="") ~id ~topics =
-    let payload =
-      create_request
-        ~op:"subscribe"
-        ~args:(`List (List.map topics ~f:(fun t -> `String t)))
-        ()
-    in
-    MD.message id topic (request_to_yojson payload)
-  in
-  let my_uuid = Uuid.(to_string @@ create ()) in
-  let make_stream_id ~addr ~id = my_uuid ^ "|" ^ addr ^ "|" ^ Int.to_string id in
-  let addr_id_of_stream_id_exn stream_id = match String.split ~on:'|' stream_id with
-  | [_; client_addr; userid] -> client_addr, Int.of_string userid
-  | _ -> invalid_arg "addr_id_of_stream_id_exn"
-  in
-  let subscribe_client ?(topic="") ~addr ~id () =
-    let id = make_stream_id ~addr ~id in
-    Pipe.write to_ws_w @@ MD.to_yojson @@ MD.subscribe ~id ~topic
-  in
-  let unsubscribe_client ?(topic="") ~addr ~id () =
-    let id = make_stream_id ~addr ~id in
-    Pipe.write to_ws_w @@ MD.to_yojson @@ MD.unsubscribe ~id ~topic
-  in
-  let connected = Mvar.create () in
+  let my_uuid = Uuid.(create () |> to_string) in
+  let connected = Condition.create () in
   let rec resubscribe () =
-    Mvar.take (Mvar.read_only connected) >>= fun () ->
+    Condition.wait connected >>= fun () ->
     Condition.broadcast ws_feed_connected () ;
-    String.Table.iter Connection.active ~f:(fun c -> c.need_resubscribe <- true);
-    Pipe.write to_ws_w @@ MD.to_yojson @@ MD.subscribe ~id:my_uuid ~topic:"" >>= fun () ->
+    Connection.iter ~f:(fun c -> c.need_resubscribe <- true);
+    Pipe.write to_ws_w MD.(subscribe ~id:my_uuid ~topic:"" |> to_yojson) >>= fun () ->
     resubscribe ()
   in
-  don't_wait_for @@ Pipe.iter_without_pushback ~continue_on_error:true new_client_accepted ~f:begin fun { to_bitmex_r } ->
-    don't_wait_for @@ Pipe.iter ~continue_on_error:true to_bitmex_r ~f:begin function
-    | Subscribe { id; addr } -> subscribe_client ~addr ~id ()
-    | Unsubscribe { id; addr } -> unsubscribe_client ~addr ~id ()
+  don't_wait_for begin
+    Pipe.iter_without_pushback
+      ~continue_on_error:true new_client_accepted ~f:begin fun { to_bitmex_r } ->
+      don't_wait_for begin
+        Pipe.iter ~continue_on_error:true to_bitmex_r ~f:begin function
+        | Subscribe { id; addr } ->
+            Pipe.write to_ws_w (subscribe_client ~uuid:my_uuid ~addr ~id ())
+        | Unsubscribe { id; addr } ->
+            Pipe.write to_ws_w  (unsubscribe_client ~uuid:my_uuid ~addr ~id ())
+        end
+      end
     end
-  end;
-  don't_wait_for @@ Pipe.iter client_deleted ~f:begin fun { addr_str=addr; usernames } ->
-    let usernames = Int.Table.to_alist usernames in
-    Deferred.List.iter usernames ~how:`Parallel ~f:(fun (id, _) -> unsubscribe_client ~addr ~id ())
-  end;
+  end ;
+  don't_wait_for begin
+    Pipe.iter client_deleted ~f:begin fun { Connection.addr ; usernames } ->
+      let usernames = Int.Table.to_alist usernames in
+      Deferred.List.iter usernames ~how:`Parallel ~f:begin fun (id, _) ->
+        Pipe.write to_ws_w (unsubscribe_client ~uuid:my_uuid ~addr ~id ())
+      end
+    end
+  end ;
   don't_wait_for @@ resubscribe ();
   let ws = open_connection ~connected ~to_ws ~log:log_ws
       ~testnet:!use_testnet ~md:true ~topics:[] () in
-  let on_ws_msg msg = match MD.of_yojson msg with
-  | Error msg ->
-    Log.error log_bitmex "%s" msg;
-    Deferred.unit
-  | Ok { MD.typ = Unsubscribe; id = stream_id; payload = None } ->
-    let client_addr, user_id = addr_id_of_stream_id_exn stream_id in
-    begin match String.Table.find Connection.active client_addr with
-    | None ->
-      Log.info log_bitmex "BitMEX unsubscribed stream for client %s, but client not in table" client_addr;
-      Deferred.unit
-    | Some c ->
-      Pipe.write c.to_client_w @@ Unsubscribe { addr=client_addr; id=user_id }
-    end
-  | Ok { MD.typ; id = stream_id; payload = Some payload } -> begin
-      match addr_id_of_stream_id_exn stream_id with
-      | exception (Invalid_argument _) -> begin match Ws.msg_of_yojson payload with
-        (* Server *)
-        | Welcome ->
-          Pipe.write to_ws_w @@ MD.to_yojson @@ subscribe_topics my_uuid bitmex_topics
-        | Error msg ->
-          Log.error log_bitmex "BitMEX: error %s" @@ show_error msg;
-          Deferred.unit
-        | Ok { request = { op = "subscribe" }; subscribe; success } ->
-          Log.info log_bitmex "BitMEX: subscribed to %s: %b" subscribe success;
-          Deferred.unit
-        | Ok { success } ->
-          Log.error log_bitmex "BitMEX: unexpected response %s" (Yojson.Safe.to_string payload);
-          Deferred.unit
-        | Update update ->
-          on_update update;
-          Deferred.unit
-        end
-      | client_addr, userid -> begin match String.Table.find Connection.active client_addr with
-        | None ->
-          Log.info log_bitmex "Got %s for %s, but client not in table"
-            (Yojson.Safe.to_string payload) client_addr;
-          Deferred.unit
-        | Some c -> match Ws.msg_of_yojson payload with
-        (* Clients *)
-        | Welcome ->
-          with_userid c ~userid ~f:begin fun ~addr_str:_ ~userid ~username ~key ~secret ->
-            Pipe.write_without_pushback to_ws_w @@ MD.to_yojson @@ MD.auth ~id:stream_id ~topic:"" ~key ~secret
-          end;
-          Deferred.unit
-        | Error msg ->
-          Log.error log_bitmex "[%s] %d: error %s" c.addr_str userid (show_error msg);
-          Deferred.unit
-        | Ok { request = { op = "authKey"}; success} ->
-          Log.debug log_bitmex "[%s] %d: subscribe to topics" c.addr_str userid;
-          Deferred.all_unit [
-            Pipe.write to_ws_w @@ MD.to_yojson @@ subscribe_topics stream_id clients_topics;
-            Pipe.write c.to_client_w @@ Subscribe { addr=client_addr; id=userid }
-          ]
-        | Ok { request = { op = "subscribe"}; subscribe; success} ->
-          Log.info log_bitmex "[%s] %d: subscribed to %s: %b" c.addr_str userid subscribe success;
-          Deferred.unit
-        | Ok { success } ->
-          Log.error log_bitmex "[%s] %d: unexpected response %s"
-            c.addr_str userid (Yojson.Safe.to_string payload);
-          Deferred.unit
-        | Update update ->
-          let client_update = { Connection.userid ; update } in
-          Pipe.write c.ws_w client_update
-        end
-    end
-  | _ ->
-    Log.error log_bitmex "BitMEX: unexpected multiplexed packet format";
-    Deferred.unit
-  in
   let th =
     Monitor.handle_errors
       (fun () -> Pipe.iter ~continue_on_error:true ws ~f:on_ws_msg)
