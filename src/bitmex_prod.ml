@@ -1519,6 +1519,10 @@ let cancel_order addr w msg =
 
 let dtcserver ~server ~port =
   let server_fun addr r w =
+    don't_wait_for begin
+      Condition.wait ws_feed_connected >>= fun () ->
+      Deferred.all_unit [Writer.close w ; Reader.close r]
+    end ;
     let addr = Socket.Address.Inet.to_string addr in
     (* So that process does not allocate all the time. *)
     let rec handle_chunk consumed buf ~pos ~len =
