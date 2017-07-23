@@ -46,15 +46,17 @@ let log_ws = Log.create ~level:`Error ~on_error:`Raise ~output:Log.Output.[stder
 
 let ws_feed_connected : unit Condition.t = Condition.create ()
 
+module ApiKey = struct
+  type t = {
+    key: string;
+    secret: string;
+  }
+end
+
 module Connection = struct
   type subscribe_msg =
     | Subscribe of { addr: string; id: int }
     | Unsubscribe of { addr: string; id: int }
-
-  type apikey = {
-    key: string;
-    secret: string;
-  }
 
   type client_update = {
     userid: int;
@@ -82,7 +84,7 @@ module Connection = struct
     rev_subs_depth: string Int32.Table.t ;
     send_secdefs: bool;
 
-    apikeys : apikey Int.Table.t; (* indexed by account *)
+    apikeys : ApiKey.t Int.Table.t; (* indexed by account *)
     usernames : string Int.Table.t; (* indexed by account *)
     accounts : int String.Table.t; (* indexed by SC username *)
     mutable need_resubscribe: bool;
@@ -621,15 +623,6 @@ let populate_api_keys ({ Connection.key ; secret } as conn) =
     Monitor.try_with_or_error (fun () -> populate_api_keys conn entries)
   end
 
-let with_userid { Connection.addr ; key ; secret ; apikeys ; usernames } ~userid ~f =
-  Int.Table.iteri apikeys ~f:begin fun ~key:userid' ~data:{ key; secret } ->
-    if userid = userid' then
-      Int.Table.find usernames userid |> Option.iter ~f:begin fun username ->
-        try f ~addr ~userid ~username ~key ~secret with
-          exn -> Log.error log_bitmex "%s" @@ Exn.to_string exn
-      end
-  end
-
 let process_orders { Connection.addr ; w ; order } partial_iv action orders =
   List.iter orders ~f:begin fun o_json ->
     let o = RespObj.of_json o_json in
@@ -664,10 +657,11 @@ let process_orders { Connection.addr ; w ; order } partial_iv action orders =
   end ;
   if action = Partial then Ivar.fill_if_empty partial_iv ()
 
-let process_margins ({ Connection.addr ; w ; margin } as c) partial_iv action margins =
+let process_margins { Connection.addr ; w ; margin ; usernames } partial_iv action margins =
   List.iteri margins ~f:begin fun i m_json ->
     let m = RespObj.of_json m_json in
     let userid = RespObj.int_exn m "account" in
+    let username = Int.Table.find_exn usernames userid in
     let currency = RespObj.string_exn m "currency" in
     match action with
     | WS.Response.Update.Delete ->
@@ -675,10 +669,8 @@ let process_margins ({ Connection.addr ; w ; margin } as c) partial_iv action ma
         IS.Table.remove margin (userid, currency)
     | Insert | Partial ->
         Log.debug log_bitmex "<- [%s] margin insert/partial" addr ;
-        IS.Table.set margin ~key:(userid, currency) ~data:m;
-        with_userid c ~userid ~f:begin fun ~addr:_ ~userid ~username ~key:_ ~secret:_ ->
-          write_balance_update ~username ~userid w m
-        end
+        IS.Table.set margin ~key:(userid, currency) ~data:m ;
+        write_balance_update ~username ~userid w m
     | Update ->
         Log.debug log_bitmex "<- [%s] margin update" addr ;
         if Ivar.is_full partial_iv then begin
@@ -687,17 +679,16 @@ let process_margins ({ Connection.addr ; w ; margin } as c) partial_iv action ma
           | Some old_m -> RespObj.merge old_m m
           in
           IS.Table.set margin ~key:(userid, currency) ~data:m;
-          with_userid c ~userid ~f:begin fun ~addr:_ ~userid ~username ~key:_ ~secret:_ ->
-            write_balance_update ~username ~userid w m
-          end
+          write_balance_update ~username ~userid w m
         end
   end ;
   if action = Partial then Ivar.fill_if_empty partial_iv ()
 
-let process_positions ({ Connection.addr ; w ; position } as c) partial_iv action positions =
+let process_positions { Connection.addr ; w ; position ; usernames } partial_iv action positions =
   List.iter positions ~f:begin fun p_json ->
     let p = RespObj.of_json p_json in
     let userid = RespObj.int_exn p "account" in
+    let username = Int.Table.find_exn usernames userid in
     let s = RespObj.string_exn p "symbol" in
     match action with
     | WS.Response.Update.Delete ->
@@ -707,10 +698,8 @@ let process_positions ({ Connection.addr ; w ; position } as c) partial_iv actio
         IS.Table.set position ~key:(userid, s) ~data:p;
         if RespObj.bool_exn p "isOpen" then begin
           Log.debug log_bitmex "<- [%s] position insert/partial" addr ;
-          with_userid c ~userid ~f:begin fun ~addr:_ ~userid ~username ~key:_ ~secret:_ ->
-            write_position_update ~userid ~username w p;
-            Log.debug log_bitmex "-> [%s] position update (%s:%d)" addr username userid
-          end
+          write_position_update ~userid ~username w p;
+          Log.debug log_bitmex "-> [%s] position update (%s:%d)" addr username userid
         end
     | Update ->
         if Ivar.is_full partial_iv then begin
@@ -722,26 +711,23 @@ let process_positions ({ Connection.addr ; w ; position } as c) partial_iv actio
           match old_p with
           | Some old_p when RespObj.bool_exn old_p "isOpen" ->
               Log.debug log_dtc "<- [%s] position update" addr ;
-              with_userid c ~userid ~f:begin fun ~addr:_ ~userid ~username ~key:_ ~secret:_ ->
-                write_position_update ~userid ~username w p ;
-                Log.debug log_bitmex "-> [%s] position update (%s:%d)" addr username userid;
-              end
+              write_position_update ~userid ~username w p ;
+              Log.debug log_bitmex "-> [%s] position update (%s:%d)" addr username userid;
           | _ -> ()
         end
   end ;
   if action = Partial then Ivar.fill_if_empty partial_iv ()
 
-let process_execs ({ Connection.addr ; w} as c) action execs =
+let process_execs { Connection.addr ; w ; usernames } action execs =
   let iter_f e_json =
     let e = RespObj.of_json e_json in
     let userid = RespObj.int_exn e "account" in
+    let username = Int.Table.find_exn usernames userid in
     let symbol = RespObj.string_exn e "symbol" in
     match action with
     | WS.Response.Update.Insert ->
         Log.debug log_bitmex "<- [%s] exec %s" addr symbol;
-        with_userid c ~userid ~f:begin fun ~addr:_ ~userid ~username ~key:_ ~secret:_ ->
-          write_order_update ~userid ~username w e
-        end
+        write_order_update ~userid ~username w e
     | _ -> ()
   in
   List.iter execs ~f:iter_f
@@ -1111,11 +1097,10 @@ let write_empty_order_update ?request_id w =
 
 let write_open_order_update ?request_id ~msg_number ~nb_msgs ~status ~conn ~w o =
   let userid = RespObj.int_exn o "account" in
-  with_userid conn ~userid ~f:begin fun ~addr:_ ~userid ~username ~key:_ ~secret:_ ->
-    let status_reason = status, `open_orders_request_response in
-    write_order_update ?request_id ~nb_msgs ~msg_number
-      ~userid ~username ~status_reason w o
-  end
+  let username = Int.Table.find_exn conn.Connection.usernames userid in
+  let status_reason = status, `open_orders_request_response in
+  write_order_update ?request_id ~nb_msgs ~msg_number
+    ~userid ~username ~status_reason w o
 
 let reject_open_orders_request ?request_id w k =
   let rej = DTC.default_open_orders_reject () in
@@ -1149,9 +1134,8 @@ let open_orders_request addr w msg =
 
 let write_current_position_update ?request_id ~msg_number ~nb_msgs ~conn ~w p =
   let userid = RespObj.int_exn p "account" in
-  with_userid conn ~userid ~f:begin fun ~addr:_ ~userid ~username ~key:_ ~secret:_ ->
-    write_position_update ?request_id ~nb_msgs ~msg_number ~userid ~username w p
-  end
+  let username = Int.Table.find_exn conn.Connection.usernames userid in
+  write_position_update ?request_id ~nb_msgs ~msg_number ~userid ~username w p
 
 let write_no_positions ?trade_account ?request_id w =
   let u = DTC.default_position_update () in
@@ -1189,16 +1173,16 @@ let current_positions_request addr w msg =
     write_no_positions ?trade_account:req.trade_account ?request_id:req.request_id w ;
   Log.debug log_dtc "-> [%s] Current Positions Request: %d positions" addr nb_msgs
 
-let send_historical_order_fills_response ~userid ~username req addr w orders =
+let send_historical_order_fills_response req addr w orders =
   let open RespObj in
   let resp = DTC.default_historical_order_fill_response () in
   let nb_msgs = List.length orders in
   resp.total_number_messages <- Some (Int32.of_int_exn nb_msgs) ;
   resp.request_id <- req.DTC.Historical_order_fills_request.request_id ;
-  resp.trade_account <- Some (trade_accountf ~userid ~username) ;
-  List.iteri orders ~f:begin fun i o ->
+  List.iteri orders ~f:begin fun i (userid, username, o) ->
     let o = of_json o in
     let side = string_exn o "side" |> Side.of_string in
+    resp.trade_account <- Some (trade_accountf ~userid ~username) ;
     resp.message_number <- Some Int32.(succ @@ of_int_exn i) ;
     resp.symbol <- Some (string_exn o "symbol") ;
     resp.exchange <- Some !my_exchange ;
@@ -1247,6 +1231,11 @@ let send_trade_history { Connection.addr ; usernames } req w = function
 | Ok (_resp, []) ->
     write_no_historical_order_fills req w
 | Ok (_resp, userids_trades) ->
+    let orders =
+      List.fold_left userids_trades ~init:[] ~f:begin fun a (userid, trades) ->
+        let username = Int.Table.find_exn usernames userid in
+        List.(rev_append (map trades ~f:(fun t -> userid, username, t)) a)
+      end in
     send_historical_order_fills_response req addr w orders
 | Error err ->
     Log.error log_bitmex "%s" @@ Error.to_string_hum err ;
@@ -1254,7 +1243,7 @@ let send_trade_history { Connection.addr ; usernames } req w = function
       "Error fetching historical order fills from BitMEX"
 
 let historical_order_fills_request addr w msg =
-    let ({ Connection.apikeys } as conn) = Connection.find_exn addr in
+    let ({ Connection.apikeys ; usernames } as conn) = Connection.find_exn addr in
     Log.debug log_dtc "<- [%s] Historical Order Fills Request" addr ;
     let req = DTC.parse_historical_order_fills_request msg in
     let trade_account = Option.value ~default:"" req.trade_account in
@@ -1279,8 +1268,10 @@ let historical_order_fills_request addr w msg =
         match Int.Table.find apikeys userid with
         | Some { key; secret } ->
             don't_wait_for begin
-              get_trade_history ?orderID:req.server_order_id ~key ~secret () >>|
-              send_trade_history conn req w
+              get_trade_history ?orderID:req.server_order_id ~key ~secret () >>| function
+              | Error err -> raise (Error.to_exn err)
+              | Ok (resp, trades) ->
+                  send_trade_history conn req w (Ok (resp, [userid, trades]))
             end
         | None ->
             reject_historical_order_fills_request ?request_id:req.request_id w
@@ -1325,13 +1316,11 @@ let account_balance_request addr w msg =
     IS.Table.fold margin ~init:1 ~f:begin fun ~key:(userid, currency) ~data:balance msg_number ->
       Int.Table.find_and_call usernames userid
         ~if_not_found:ignore
-        ~if_found:begin fun usernames ->
-          List.iter usernames ~f:begin fun username ->
-            write_balance_update ?request_id:req.request_id ~msg_number ~nb_msgs
-              ~username ~userid w balance ;
-             Log.debug log_dtc "-> [%s] account balance: %s:%d" addr username userid
-          end
-        end;
+        ~if_found:begin fun username ->
+          write_balance_update ?request_id:req.request_id ~msg_number ~nb_msgs
+            ~username ~userid w balance ;
+          Log.debug log_dtc "-> [%s] account balance: %s:%d" addr username userid
+        end ;
       succ msg_number
     end |> ignore
   else begin
@@ -1460,7 +1449,7 @@ let amend_order addr w req key secret orderID ordType =
     Log.error log_bitmex "%s" err_str
 
 let cancel_replace_order addr w msg =
-  let ({ Connection.addr ; order } as conn) = Connection.find_exn addr in
+  let ({ Connection.addr ; order ; apikeys } as conn) = Connection.find_exn addr in
   Log.debug log_dtc "<- [%s] Cancel Replace Order" addr ;
   let req = DTC.parse_cancel_replace_order msg in
   let order_type = Option.value ~default:`order_type_unset req.order_type in
@@ -1480,9 +1469,8 @@ let cancel_replace_order addr w msg =
       reject_cancel_replace_order req addr w "Order Not Found"
   | Some (orderID, userid, o) ->
       let ordType = RespObj.string_exn o "ordType" |> OrderType.of_string in
-      with_userid conn ~userid ~f:begin fun ~addr:_ ~userid ~username ~key ~secret ->
-        don't_wait_for (amend_order addr w req key secret orderID ordType)
-      end
+      let { ApiKey.key ; secret } = Int.Table.find_exn apikeys userid in
+      don't_wait_for (amend_order addr w req key secret orderID ordType)
 
 let reject_cancel_order (req : DTC.Cancel_order.t) addr w k =
   let rej = DTC.default_order_update () in
@@ -1508,7 +1496,7 @@ let cancel_order req addr w key secret orderID =
     Log.error log_bitmex "%s" err_str
 
 let cancel_order addr w msg =
-    let ({ Connection.addr ; order } as conn) = Connection.find_exn addr in
+    let ({ Connection.addr ; order ; apikeys } as conn) = Connection.find_exn addr in
     Log.debug log_dtc "<- [%s] Cancel Order" addr ;
     let req = DTC.parse_cancel_order msg in
     match Option.bind req.server_order_id ~f:begin fun orderID ->
@@ -1518,9 +1506,8 @@ let cancel_order addr w msg =
         Log.error log_bitmex "Order Cancel: Order Not Found" ;
         reject_cancel_order req addr w "Order Not Found"
     | Some (orderID, userid, o) ->
-      with_userid conn ~userid ~f:begin fun ~addr:_ ~userid ~username ~key ~secret ->
+        let { ApiKey.key ; secret } = Int.Table.find_exn apikeys userid in
         don't_wait_for @@ cancel_order req addr w key secret orderID
-      end
 
 let dtcserver ~server ~port =
   let server_fun addr r w =
@@ -1733,10 +1720,10 @@ let on_ws_msg to_ws_w my_uuid msg =
 
       (* Clients *)
       | Welcome _, Some (conn, userid) ->
-          with_userid conn ~userid ~f:begin fun ~addr:_ ~userid ~username ~key ~secret ->
-            Pipe.write_without_pushback to_ws_w @@
+          let { ApiKey.key ; secret } =
+            Int.Table.find_exn conn.Connection.apikeys userid in
+          Pipe.write_without_pushback to_ws_w
             MD.(auth ~id ~topic:"" ~key ~secret |> to_yojson)
-          end
       | Error err, Some (conn, userid) ->
           Log.error log_bitmex "[%s] %d: error %s" conn.addr userid err ;
       | Response { request = AuthKey _ ; success}, Some (conn, userid) ->
