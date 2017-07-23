@@ -1129,8 +1129,8 @@ let open_orders_request addr w msg =
       end ;
       Log.debug log_bitmex "[%s] -> Open Orders Response: %d Open Orders" addr nb_msgs
   | exception No_such_order ->
-      reject_open_orders_request ?request_id:req.request_id w "No such order" ;
-      Log.error log_bitmex "[%s] -> Open Order Reject: No such order" addr
+      write_empty_order_update ?request_id:req.request_id w ;
+      Log.error log_bitmex "[%s] -> Open Order Response: No Such Open Order" addr
 
 let write_current_position_update ?request_id ~msg_number ~nb_msgs ~conn ~w p =
   let userid = RespObj.int_exn p "account" in
