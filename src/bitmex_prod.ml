@@ -83,8 +83,8 @@ module Connection = struct
     send_secdefs: bool;
 
     apikeys : apikey Int.Table.t; (* indexed by account *)
-    usernames : String.t list Int.Table.t; (* indexed by account *)
-    accounts : Int.t list String.Table.t; (* indexed by SC username *)
+    usernames : string Int.Table.t; (* indexed by account *)
+    accounts : int String.Table.t; (* indexed by SC username *)
     mutable need_resubscribe: bool;
   }
 
@@ -538,13 +538,6 @@ let write_balance_update ?request_id ?(msg_number=1) ?(nb_msgs=1) ~userid ~usern
   u.trade_account <- Some (trade_accountf ~userid ~username) ;
   write_message w `account_balance_update DTC.gen_account_balance_update u
 
-let get_trade_accounts ~apikeys ~usernames =
-  List.map (Int.Table.keys apikeys) ~f:begin fun userid ->
-    Option.value_map (Int.Table.find usernames userid)
-      ~default:[]
-      ~f:(List.map ~f:(fun username -> trade_accountf ~userid ~username))
-  end |> List.concat
-
 let write_trade_account ?request_id ~message_number ~total_number_messages ~trade_account w =
   let resp = DTC.default_trade_account_response () in
   resp.total_number_messages <- Some (Int32.of_int_exn total_number_messages) ;
@@ -553,75 +546,87 @@ let write_trade_account ?request_id ~message_number ~total_number_messages ~trad
   resp.request_id <- request_id ;
   write_message w `trade_account_response DTC.gen_trade_account_response resp
 
-let write_trade_accounts ?request_id { Connection.addr ; w ; usernames ; apikeys } =
-  let trade_accounts = get_trade_accounts apikeys usernames in
-  let total_number_messages = List.length trade_accounts in
+let write_trade_accounts ?request_id { Connection.addr ; w ; usernames } =
+  let total_number_messages, trade_accounts =
+    Int.Table.fold usernames ~init:(0, [])
+      ~f:begin fun ~key:userid ~data:username (i, accounts) ->
+        succ i, trade_accountf ~userid ~username :: accounts
+      end in
   List.iteri trade_accounts ~f:begin fun i trade_account ->
-    write_trade_account ?request_id ~message_number:(succ i) ~total_number_messages ~trade_account w
+    write_trade_account ?request_id
+      ~message_number:(succ i) ~total_number_messages ~trade_account w
   end ;
-  Log.debug log_dtc "-> [%s] Trade Account Response: %d accounts" addr total_number_messages
+  Log.debug log_dtc "-> [%s] Trade Account Response: %d accounts"
+    addr total_number_messages
 
 let add_api_keys
-    ({ addr; apikeys; usernames; accounts } : Connection.t)
-    ({ id; secret; permissions; enabled; userId } : REST.ApiKey.t) =
+    { Connection.addr; apikeys; usernames; accounts }
+    { REST.ApiKey.id; secret; permissions; enabled; userId } =
   if enabled then begin
     Int.Table.set apikeys ~key:userId ~data:{ key = id ; secret };
-    let usernames' = List.filter_map permissions ~f:begin function
+    let sc_account = List.find_map permissions ~f:begin function
       | Dtc username -> Some username
       | Perm _ -> None
       end
     in
-    Int.Table.set usernames userId usernames';
-    List.iter usernames' ~f:begin fun u ->
-      String.Table.add_multi accounts u userId;
-      Log.debug log_bitmex "[%s] Add key for %s:%d" addr u userId
+    Option.iter sc_account ~f:begin fun sc_account ->
+      Int.Table.set usernames userId sc_account ;
+      String.Table.set accounts sc_account userId ;
+      Log.debug log_bitmex "[%s] Add key for %s:%d" addr sc_account userId
     end
   end
 
-let populate_api_keys ({ Connection.addr; w; to_bitmex_r; to_bitmex_w; to_client_r; to_client_w;
-                         key; secret; apikeys; usernames; accounts; need_resubscribe } as c) =
-  let rec inner_exn entries =
-    Log.debug log_bitmex "[%s] Found %d api keys entries" addr @@ List.length entries;
-    let old_apikeys = Int.Set.of_hashtbl_keys apikeys in
-    Int.Table.clear apikeys;
-    Int.Table.clear usernames;
-    String.Table.clear accounts;
-    List.iter entries ~f:(add_api_keys c);
-    let new_apikeys = Int.Set.of_hashtbl_keys apikeys in
-    if not @@ Int.Set.equal old_apikeys new_apikeys then write_trade_accounts c ;
-    let keys_to_delete = if need_resubscribe then Int.Set.empty else Int.Set.diff old_apikeys new_apikeys in
-    let keys_to_add = if need_resubscribe then new_apikeys else Int.Set.diff new_apikeys old_apikeys in
-    Log.debug log_bitmex "[%s] add %d key(s), delete %d key(s)" addr
-      (Int.Set.length keys_to_add) (Int.Set.length keys_to_delete);
-    Deferred.List.iter (Int.Set.to_list keys_to_delete) ~how:`Sequential ~f:begin fun id ->
-      Log.debug log_bitmex "[%s] Unsubscribe %d" addr id;
-      Pipe.write to_bitmex_w @@ Unsubscribe { addr ; id } >>= fun () ->
-      Pipe.read to_client_r >>| function
-      | `Ok Unsubscribe { id=id'; addr=addr' } when id = id' && addr = addr' -> ()
-      | _ -> failwithf "Unsubscribe %s %d failed" addr id ()
-    end >>= fun () ->
-    Deferred.List.iter (Int.Set.to_list keys_to_add) ~how:`Sequential ~f:begin fun id ->
-      Log.debug log_bitmex "[%s] Subscribe %d" addr id;
-      Pipe.write to_bitmex_w @@ Subscribe { addr ; id } >>= fun () ->
-      Pipe.read to_client_r >>| function
-      | `Ok Subscribe { id=id'; addr=addr' } when id = id' && addr = addr' -> ()
-      | _ -> failwithf "Subscribe %s %d failed" addr id ()
-    end >>| fun () ->
-    c.need_resubscribe <- false
-  in
-  let inner (_response, entries) =
-    Monitor.try_with_or_error (fun () -> inner_exn entries) in
+let rec populate_api_keys
+    ({ Connection.addr ; apikeys ; usernames ; accounts ; need_resubscribe ;
+        to_bitmex_w ; to_client_r } as conn) entries =
+  Log.debug log_bitmex "[%s] Found %d api keys entries"
+    addr (List.length entries) ;
+  let old_apikeys = Int.Set.of_hashtbl_keys apikeys in
+  Int.Table.clear apikeys;
+  Int.Table.clear usernames;
+  String.Table.clear accounts;
+  List.iter entries ~f:(add_api_keys conn);
+  let new_apikeys = Int.Set.of_hashtbl_keys apikeys in
+  if not @@ Int.Set.equal old_apikeys new_apikeys then
+    write_trade_accounts conn ;
+  let keys_to_delete =
+    if need_resubscribe then Int.Set.empty else
+    Int.Set.diff old_apikeys new_apikeys in
+  let keys_to_add =
+    if need_resubscribe then new_apikeys
+    else Int.Set.diff new_apikeys old_apikeys in
+  Log.debug log_bitmex "[%s] add %d key(s), delete %d key(s)" addr
+    (Int.Set.length keys_to_add) (Int.Set.length keys_to_delete);
+  Deferred.List.iter
+    (Int.Set.to_list keys_to_delete) ~how:`Sequential ~f:begin fun id ->
+    Log.debug log_bitmex "[%s] Unsubscribe %d" addr id;
+    Pipe.write to_bitmex_w @@ Unsubscribe { addr ; id } >>= fun () ->
+    Pipe.read to_client_r >>| function
+    | `Ok Unsubscribe { id=id'; addr=addr' } when id = id' && addr = addr' -> ()
+    | _ -> failwithf "Unsubscribe %s %d failed" addr id ()
+  end >>= fun () ->
+  Deferred.List.iter
+    (Int.Set.to_list keys_to_add) ~how:`Sequential ~f:begin fun id ->
+    Log.debug log_bitmex "[%s] Subscribe %d" addr id;
+    Pipe.write to_bitmex_w @@ Subscribe { addr ; id } >>= fun () ->
+    Pipe.read to_client_r >>| function
+    | `Ok Subscribe { id=id'; addr=addr' } when id = id' && addr = addr' -> ()
+    | _ -> failwithf "Subscribe %s %d failed" addr id ()
+  end >>| fun () ->
+  conn.need_resubscribe <- false
+
+let populate_api_keys ({ Connection.key ; secret } as conn) =
   REST.ApiKey.dtc ~log:log_bitmex ~key ~secret ~testnet:!use_testnet () |>
-  Deferred.Or_error.bind ~f:inner
+  Deferred.Or_error.bind ~f:begin fun (_response, entries) ->
+    Monitor.try_with_or_error (fun () -> populate_api_keys conn entries)
+  end
 
 let with_userid { Connection.addr ; key ; secret ; apikeys ; usernames } ~userid ~f =
   Int.Table.iteri apikeys ~f:begin fun ~key:userid' ~data:{ key; secret } ->
     if userid = userid' then
-      Int.Table.find usernames userid |> Option.iter ~f:begin fun usernames ->
-        List.iter usernames ~f:begin fun username ->
-          try f ~addr ~userid ~username ~key ~secret with
-            exn -> Log.error log_bitmex "%s" @@ Exn.to_string exn
-        end
+      Int.Table.find usernames userid |> Option.iter ~f:begin fun username ->
+        try f ~addr ~userid ~username ~key ~secret with
+          exn -> Log.error log_bitmex "%s" @@ Exn.to_string exn
       end
   end
 
@@ -734,7 +739,7 @@ let process_execs ({ Connection.addr ; w} as c) action execs =
     match action with
     | WS.Response.Update.Insert ->
         Log.debug log_bitmex "<- [%s] exec %s" addr symbol;
-        with_userid c ~userid ~f:begin fun ~addr ~userid ~username ~key:_ ~secret:_ ->
+        with_userid c ~userid ~f:begin fun ~addr:_ ~userid ~username ~key:_ ~secret:_ ->
           write_order_update ~userid ~username w e
         end
     | _ -> ()
@@ -1106,7 +1111,7 @@ let write_empty_order_update ?request_id w =
 
 let write_open_order_update ?request_id ~msg_number ~nb_msgs ~status ~conn ~w o =
   let userid = RespObj.int_exn o "account" in
-  with_userid conn ~userid ~f:begin fun ~addr ~userid ~username ~key:_ ~secret:_ ->
+  with_userid conn ~userid ~f:begin fun ~addr:_ ~userid ~username ~key:_ ~secret:_ ->
     let status_reason = status, `open_orders_request_response in
     write_order_update ?request_id ~nb_msgs ~msg_number
       ~userid ~username ~status_reason w o
@@ -1144,7 +1149,7 @@ let open_orders_request addr w msg =
 
 let write_current_position_update ?request_id ~msg_number ~nb_msgs ~conn ~w p =
   let userid = RespObj.int_exn p "account" in
-  with_userid conn ~userid ~f:begin fun ~addr ~userid ~username ~key:_ ~secret:_ ->
+  with_userid conn ~userid ~f:begin fun ~addr:_ ~userid ~username ~key:_ ~secret:_ ->
     write_position_update ?request_id ~nb_msgs ~msg_number ~userid ~username w p
   end
 
@@ -1184,13 +1189,13 @@ let current_positions_request addr w msg =
     write_no_positions ?trade_account:req.trade_account ?request_id:req.request_id w ;
   Log.debug log_dtc "-> [%s] Current Positions Request: %d positions" addr nb_msgs
 
-let send_historical_order_fills_response req addr w orders =
+let send_historical_order_fills_response ~userid ~username req addr w orders =
   let open RespObj in
   let resp = DTC.default_historical_order_fill_response () in
   let nb_msgs = List.length orders in
   resp.total_number_messages <- Some (Int32.of_int_exn nb_msgs) ;
   resp.request_id <- req.DTC.Historical_order_fills_request.request_id ;
-  resp.trade_account <- req.trade_account ;
+  resp.trade_account <- Some (trade_accountf ~userid ~username) ;
   List.iteri orders ~f:begin fun i o ->
     let o = of_json o in
     let side = string_exn o "side" |> Side.of_string in
@@ -1238,10 +1243,10 @@ let get_trade_history ?orderID ~key ~secret () =
   REST.Execution.trade_history
     ~log:log_bitmex ~testnet:!use_testnet ~key ~secret ~filter ()
 
-let send_trade_history addr req w = function
+let send_trade_history { Connection.addr ; usernames } req w = function
 | Ok (_resp, []) ->
     write_no_historical_order_fills req w
-| Ok (_resp, orders) ->
+| Ok (_resp, userids_trades) ->
     send_historical_order_fills_response req addr w orders
 | Error err ->
     Log.error log_bitmex "%s" @@ Error.to_string_hum err ;
@@ -1249,7 +1254,7 @@ let send_trade_history addr req w = function
       "Error fetching historical order fills from BitMEX"
 
 let historical_order_fills_request addr w msg =
-    let ({ Connection.apikeys } as c) = Connection.find_exn addr in
+    let ({ Connection.apikeys } as conn) = Connection.find_exn addr in
     Log.debug log_dtc "<- [%s] Historical Order Fills Request" addr ;
     let req = DTC.parse_historical_order_fills_request msg in
     let trade_account = Option.value ~default:"" req.trade_account in
@@ -1260,22 +1265,22 @@ let historical_order_fills_request addr w msg =
             ~init:(None, []) ~f:begin fun (_, a) (userid, { key; secret }) ->
             get_trade_history ?orderID:req.server_order_id ~key ~secret () >>| function
             | Error err -> raise (Error.to_exn err)
-            | Ok (resp, trades) -> Some resp, List.rev_append a trades
+            | Ok (resp, trades) -> Some resp, (userid, trades) :: a
           end
         end >>| function
         | Error err ->
             reject_historical_order_fills_request ?request_id:req.request_id
               w "Error while fetching historical order fills"
         | Ok (None, _) -> assert false
-        | Ok (Some resp, trades) ->
-            send_trade_history addr req w (Ok (resp, trades))
+        | Ok (Some resp, userids_trades) ->
+            send_trade_history conn req w (Ok (resp, userids_trades))
       end
     | Some userid -> begin
         match Int.Table.find apikeys userid with
         | Some { key; secret } ->
             don't_wait_for begin
               get_trade_history ?orderID:req.server_order_id ~key ~secret () >>|
-              send_trade_history addr req w
+              send_trade_history conn req w
             end
         | None ->
             reject_historical_order_fills_request ?request_id:req.request_id w
@@ -1475,7 +1480,7 @@ let cancel_replace_order addr w msg =
       reject_cancel_replace_order req addr w "Order Not Found"
   | Some (orderID, userid, o) ->
       let ordType = RespObj.string_exn o "ordType" |> OrderType.of_string in
-      with_userid conn ~userid ~f:begin fun ~addr ~userid ~username ~key ~secret ->
+      with_userid conn ~userid ~f:begin fun ~addr:_ ~userid ~username ~key ~secret ->
         don't_wait_for (amend_order addr w req key secret orderID ordType)
       end
 
