@@ -414,6 +414,58 @@ module Quotes = struct
     Connection.iter ~f:on_connection
 end
 
+module TradeHistory = struct
+  let buf = Bi_outbuf.create 4096
+  let trades_by_uuid : RespObj.t String.Table.t = String.Table.create ()
+  let table : RespObj.t String.Map.t String.Table.t = String.Table.create ()
+
+  let add_tradeAccount ~userid ~username =
+    String.Map.add ~key:"tradeAccount"
+      ~data:(`String (trade_accountf ~userid ~username))
+
+  let get ~userid ~username ~key ~secret =
+    let filter = `Assoc ["execType", `String "Trade"] in
+    REST.Execution.all_trade_history
+      ~buf ~log:log_bitmex ~testnet:!use_testnet
+      ~filter ~key ~secret () >>| function
+    | Error err ->
+      Log.error log_bitmex "%s" (Error.to_string_hum err) ;
+      Error err
+    | Ok (resp, trades) ->
+      let trades =
+        List.fold_left trades ~init:String.Map.empty ~f:begin fun a trade ->
+          let trade = RespObj.of_json trade in
+          let trade = add_tradeAccount ~userid ~username trade in
+          let orderID = RespObj.string_exn trade "orderID" in
+          String.Table.set trades_by_uuid orderID trade ;
+          String.Map.add a orderID trade ;
+        end in
+      String.Table.set table key trades ;
+      Ok trades
+
+  let get { Connection.apikeys ; usernames } ~userid =
+    let { ApiKey.key ; secret } = Int.Table.find_exn apikeys userid in
+    let username = Int.Table.find_exn usernames userid in
+    match String.Table.find table key with
+    | Some trades -> Deferred.Or_error.return trades
+    | None -> get ~userid ~username ~key ~secret
+
+  let get_one = String.Table.find trades_by_uuid
+
+  let get_all ({ Connection.apikeys ; usernames } as conn) =
+    let apikeys = Hashtbl.to_alist apikeys in
+    Deferred.List.fold apikeys
+      ~init:String.Map.empty ~f:begin fun a (userid, _) ->
+      get conn ~userid >>| function
+      | Error err ->
+          Log.error log_bitmex "%s" (Error.to_string_hum err) ;
+          a
+      | Ok trades ->
+          String.Map.fold trades ~init:a
+            ~f:(fun ~key ~data a -> String.Map.add ~key ~data a)
+    end
+end
+
 let send_heartbeat { Connection.addr ; w } span =
   let msg = DTC.default_heartbeat () in
   Clock_ns.every
@@ -1173,31 +1225,31 @@ let current_positions_request addr w msg =
     write_no_positions ?trade_account:req.trade_account ?request_id:req.request_id w ;
   Log.debug log_dtc "-> [%s] Current Positions Request: %d positions" addr nb_msgs
 
-let send_historical_order_fills_response req addr w orders =
+let send_historical_order_fills_response req addr w trades =
   let open RespObj in
   let resp = DTC.default_historical_order_fill_response () in
-  let nb_msgs = List.length orders in
+  let nb_msgs = String.Map.length trades in
   resp.total_number_messages <- Some (Int32.of_int_exn nb_msgs) ;
   resp.request_id <- req.DTC.Historical_order_fills_request.request_id ;
-  List.iteri orders ~f:begin fun i (userid, username, o) ->
-    let o = of_json o in
-    let side = string_exn o "side" |> Side.of_string in
-    resp.trade_account <- Some (trade_accountf ~userid ~username) ;
-    resp.message_number <- Some Int32.(succ @@ of_int_exn i) ;
-    resp.symbol <- Some (string_exn o "symbol") ;
+  String.Map.fold trades ~init:1l ~f:begin fun ~key:_ ~data:t message_number ->
+    let side = string_exn t "side" |> Side.of_string in
+    resp.trade_account <- Some (string_exn t "tradeAccount") ;
+    resp.message_number <- Some message_number ;
+    resp.symbol <- Some (string_exn t "symbol") ;
     resp.exchange <- Some !my_exchange ;
-    resp.server_order_id <- Some (string_exn o "orderID") ;
-    resp.price <- Some (float_exn o "avgPx") ;
-    resp.quantity <- Some Float.(of_int64 (int64_exn o "orderQty")) ;
+    resp.server_order_id <- Some (string_exn t "orderID") ;
+    resp.price <- Some (float_exn t "avgPx") ;
+    resp.quantity <- Some Float.(of_int64 (int64_exn t "orderQty")) ;
     resp.date_time <-
-      string o "transactTime" |>
+      string t "transactTime" |>
       Option.map ~f:(Fn.compose seconds_int64_of_ts Time_ns.of_string) ;
     resp.buy_sell <- Some side ;
-    resp.unique_execution_id <- Some (string_exn o "execID") ;
+    resp.unique_execution_id <- Some (string_exn t "execID") ;
     write_message w `historical_order_fill_response
-      DTC.gen_historical_order_fill_response resp
-  end ;
-  Log.debug log_dtc "-> [%s] Historical Order Fills Response %d" addr nb_msgs
+      DTC.gen_historical_order_fill_response resp ;
+    Int32.succ message_number
+  end |> fun _ ->
+  Log.debug log_dtc "-> [%s] Historical Order Fills Response (%d fills)" addr nb_msgs
 
 let reject_historical_order_fills_request ?request_id w k =
   let rej = DTC.default_historical_order_fills_reject () in
@@ -1219,64 +1271,44 @@ let write_no_historical_order_fills req w =
   write_message w `historical_order_fill_response
     DTC.gen_historical_order_fill_response u
 
-let get_trade_history ?orderID ~key ~secret () =
-  let filter = `Assoc begin List.filter_opt [
-      Option.map orderID ~f:(fun id -> ("orderID", `String id)) ;
-      Some ("execType", `String "Trade")
-    ] end in
-  REST.Execution.trade_history
-    ~log:log_bitmex ~testnet:!use_testnet ~key ~secret ~filter ()
-
-let send_trade_history { Connection.addr ; usernames } req w = function
-| Ok (_resp, []) ->
-    write_no_historical_order_fills req w
-| Ok (_resp, userids_trades) ->
-    let orders =
-      List.fold_left userids_trades ~init:[] ~f:begin fun a (userid, trades) ->
-        let username = Int.Table.find_exn usernames userid in
-        List.(rev_append (map trades ~f:(fun t -> userid, username, t)) a)
-      end in
-    send_historical_order_fills_response req addr w orders
-| Error err ->
-    Log.error log_bitmex "%s" @@ Error.to_string_hum err ;
-    reject_historical_order_fills_request ?request_id:req.request_id w
-      "Error fetching historical order fills from BitMEX"
-
 let historical_order_fills_request addr w msg =
     let ({ Connection.apikeys ; usernames } as conn) = Connection.find_exn addr in
     Log.debug log_dtc "<- [%s] Historical Order Fills Request" addr ;
     let req = DTC.parse_historical_order_fills_request msg in
+    let orderID = Option.value ~default:"" req.server_order_id in
     let trade_account = Option.value ~default:"" req.trade_account in
-    match Option.map (cut_trade_account trade_account) ~f:snd with
-    | None -> don't_wait_for begin
-        Monitor.try_with_or_error begin fun () ->
-          Deferred.List.fold (Int.Table.to_alist apikeys)
-            ~init:(None, []) ~f:begin fun (_, a) (userid, { key; secret }) ->
-            get_trade_history ?orderID:req.server_order_id ~key ~secret () >>| function
-            | Error err -> raise (Error.to_exn err)
-            | Ok (resp, trades) -> Some resp, (userid, trades) :: a
-          end
-        end >>| function
-        | Error err ->
-            reject_historical_order_fills_request ?request_id:req.request_id
-              w "Error while fetching historical order fills"
-        | Ok (None, _) -> assert false
-        | Ok (Some resp, userids_trades) ->
-            send_trade_history conn req w (Ok (resp, userids_trades))
+    match orderID, Option.map (cut_trade_account trade_account) ~f:snd with
+    | "", None -> don't_wait_for begin
+        TradeHistory.get_all conn >>| function
+        | trades when String.Map.is_empty trades ->
+            write_no_historical_order_fills req w
+        | trades ->
+            send_historical_order_fills_response req addr w trades
       end
-    | Some userid -> begin
+    | "", Some userid -> begin
         match Int.Table.find apikeys userid with
         | Some { key; secret } ->
             don't_wait_for begin
-              get_trade_history ?orderID:req.server_order_id ~key ~secret () >>| function
-              | Error err -> raise (Error.to_exn err)
-              | Ok (resp, trades) ->
-                  send_trade_history conn req w (Ok (resp, [userid, trades]))
+              TradeHistory.get conn ~userid >>| function
+              | Error err ->
+                  Log.error log_bitmex "%s" @@ Error.to_string_hum err ;
+                  reject_historical_order_fills_request ?request_id:req.request_id w
+                    "Error fetching historical order fills from BitMEX"
+              | Ok trades when String.Map.is_empty trades ->
+                  write_no_historical_order_fills req w
+              | Ok trades ->
+                  send_historical_order_fills_response req addr w trades
             end
         | None ->
             reject_historical_order_fills_request ?request_id:req.request_id w
               "No such account %s" trade_account
       end
+    | orderID, _ ->
+        match TradeHistory.get_one orderID with
+        | None -> write_no_historical_order_fills req w
+        | Some t ->
+            send_historical_order_fills_response req addr w
+              (String.Map.singleton orderID t)
 
 let trade_accounts_request addr w msg =
   let req = DTC.parse_trade_accounts_request msg in
