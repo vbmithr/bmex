@@ -28,22 +28,26 @@ apt install opam
 apt install -qq -yy libffi-dev libgmp-dev libleveldb-dev libsnappy-dev libssl-dev libxen-dev uuid-dev zlib1g-dev
 su dtc
 opam init
-opam switch 4.04.0
+opam switch 4.05.0
 eval $(opam config env)
 opam repo add janestreet git://github.com/janestreet/opam-repository
 
-git clone https://github.com/vbmithr/bmex.git
+git clone --recursive https://github.com/vbmithr/bmex-full.git
 cd bmex_dtc
 
 # Install ocaml deps
-./scripts/install_bmex.sh
+opam pin --dev-repo ocplib-json-typed
+opam install astring async_ssl base64 cmdliner cstruct digestif
+             fmt hex jsonm leveldb logs magic-mime ocplib-endian
+             piqi uri yojson
+
 # Build the project
 make
 
 # Run the daemon (yeah, an exe file on Linux)
-./_build/default/src/bmex.exe -help
+./_build/install/default/bin/bmex-prod -help
 # Or,
-./_build/default/src/bmex.exe -port 5567 -daemon -tls -testnet -loglevel 3
+./_build/install/default/bin/bitmex-prod -port 5567 -daemon -tls -testnet -loglevel 3
 ```
 
 Sierra Chart expects bmex to run on port 5567 with TLS enabled.
@@ -51,9 +55,16 @@ Sierra Chart expects bmex to run on port 5567 with TLS enabled.
 ## Upgrade
 
 ```bash
-opam pin remove $(opam pin -s)
-opam update
-opam upgrade
+git submodule update --remote bmex
+git submodule update --remote bs_devkit
+git submodule update --remote ocaml-bmex
+git submodule update --remote ocaml-cohttp
+git submodule update --remote ocaml-conduit
+git submodule update --remote ocaml-dtc-pb
+git submodule update --remote ocaml-ipaddr
+git submodule update --remote ocaml-scid
+git submodule update --remote ocaml-tick
+git submodule update --remote ocaml-websocket
 ```
 
 Then continue from `Install ocaml deps` above.
