@@ -1744,8 +1744,7 @@ let on_ws_msg to_ws_w my_uuid msg =
       | _ -> ()
     end
 
-let bitmex_ws
-    ~instrs_initialized ~orderbook_initialized ~quotes_initialized =
+let bitmex_ws () =
   let open Bmex_ws in
   let to_ws, to_ws_w = Pipe.create () in
   let my_uuid = Uuid.(create () |> to_string) in
@@ -1795,15 +1794,10 @@ let main
   let pidfile = if testnet then add_suffix pidfile "_testnet" else pidfile in
   let logfile = if testnet then add_suffix logfile "_testnet" else logfile in
   let run ~server ~port =
-    let instrs_initialized = Ivar.create () in
-    let orderbook_initialized = Ivar.create () in
-    let quotes_initialized = Ivar.create () in
     Log.info log_bitmex "WS feed starting";
-    let bitmex_th =
-      bitmex_ws ~instrs_initialized ~orderbook_initialized ~quotes_initialized
-    in
+    let bitmex_th = bitmex_ws () in
     Deferred.List.iter ~how:`Parallel ~f:Ivar.read
-      [instrs_initialized; orderbook_initialized; quotes_initialized] >>= fun () ->
+      [Instrument.initialized; Books.initialized; Quotes.initialized] >>= fun () ->
     dtcserver ~server ~port >>= fun dtc_server ->
     Log.info log_dtc "DTC server started";
     Deferred.all_unit [Tcp.Server.close_finished dtc_server; bitmex_th.th]
