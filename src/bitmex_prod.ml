@@ -814,8 +814,6 @@ let client_ws ({ Connection.addr; w; ws_r; key; secret; order; margin; position 
     (fun exn -> Log.error log_bitmex "%s" @@ Exn.to_string exn);
   start
 
-exception No_such_order
-
 let new_client_accepted, new_client_accepted_w = Pipe.create ()
 let client_deleted, client_deleted_w = Pipe.create ()
 
@@ -1126,14 +1124,14 @@ let get_open_orders ?user_id ?order_id order_table =
       begin match Int.Table.find order_table user_id with
       | None -> []
       | Some table -> begin match Uuid.Table.find table order_id with
-        | None -> raise No_such_order
+        | None -> []
         | Some o ->
             match order_is_open o with None -> [] | Some status -> [status, o]
         end
       end
   | None, Some order_id ->
       begin match Order.find order_table order_id with
-      | None -> raise No_such_order
+      | None -> []
       | Some (_uuid, uid, o) ->
           match order_is_open o with Some status -> [status, o] | None -> []
       end
@@ -1168,7 +1166,8 @@ let open_orders_request addr w msg =
   let req = DTC.parse_open_orders_request msg in
   let trade_account = Option.value ~default:"" req.trade_account in
   let user_id = Option.(cut_trade_account trade_account >>| snd) in
-  let order_id = Option.map req.server_order_id ~f:Uuid.of_string in
+  let order_id = Option.bind req.server_order_id
+      ~f:(function "" -> None | uuid -> Some (Uuid.of_string uuid)) in
   match get_open_orders ?user_id ?order_id conn.Connection.order with
   | [] ->
       write_empty_order_update ?request_id:req.request_id w ;
@@ -1180,9 +1179,6 @@ let open_orders_request addr w msg =
           ~status ~conn ~w o
       end ;
       Log.debug log_bitmex "[%s] -> Open Orders Response: %d Open Orders" addr nb_msgs
-  | exception No_such_order ->
-      write_empty_order_update ?request_id:req.request_id w ;
-      Log.error log_bitmex "[%s] -> Open Order Response: No Such Open Order" addr
 
 let write_current_position_update ?request_id ~msg_number ~nb_msgs ~conn ~w p =
   let userid = RespObj.int_exn p "account" in
