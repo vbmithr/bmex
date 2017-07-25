@@ -417,7 +417,7 @@ end
 module TradeHistory = struct
   let buf = Bi_outbuf.create 4096
   let trades_by_uuid : RespObj.t String.Table.t = String.Table.create ()
-  let table : RespObj.t String.Map.t String.Table.t = String.Table.create ()
+  let table : RespObj.t String.Map.t Int.Table.t = Int.Table.create ()
 
   let add_tradeAccount ~userid ~username =
     String.Map.add ~key:"tradeAccount"
@@ -440,13 +440,13 @@ module TradeHistory = struct
           String.Table.set trades_by_uuid orderID trade ;
           String.Map.add a orderID trade ;
         end in
-      String.Table.set table key trades ;
+      Int.Table.set table userid trades ;
       Ok trades
 
   let get { Connection.apikeys ; usernames } ~userid =
     let { ApiKey.key ; secret } = Int.Table.find_exn apikeys userid in
     let username = Int.Table.find_exn usernames userid in
-    match String.Table.find table key with
+    match Int.Table.find table userid with
     | Some trades -> Deferred.Or_error.return trades
     | None -> get ~userid ~username ~key ~secret
 
@@ -464,6 +464,15 @@ module TradeHistory = struct
           String.Map.fold trades ~init:a
             ~f:(fun ~key ~data a -> String.Map.add ~key ~data a)
     end
+
+  let set trade =
+    let userid = RespObj.int_exn trade "account" in
+    let orderID = RespObj.string_exn trade "orderID" in
+    String.Table.set trades_by_uuid orderID trade ;
+    let data = Option.value_map (Int.Table.find table userid)
+        ~default:(String.Map.singleton orderID trade)
+        ~f:(String.Map.add ~key:orderID ~data:trade) in
+    Int.Table.set table ~key:userid ~data
 end
 
 let send_heartbeat { Connection.addr ; w } span =
@@ -770,17 +779,20 @@ let process_positions { Connection.addr ; w ; position ; usernames } partial_iv 
   end ;
   if action = Partial then Ivar.fill_if_empty partial_iv ()
 
-let process_execs { Connection.addr ; w ; usernames } action execs =
-  let iter_f e_json =
-    let e = RespObj.of_json e_json in
+let process_execs { Connection.addr ; w ; usernames } execs =
+  let iter_f e =
+    let e = RespObj.of_json e in
     let userid = RespObj.int_exn e "account" in
     let username = Int.Table.find_exn usernames userid in
     let symbol = RespObj.string_exn e "symbol" in
-    match action with
-    | WS.Response.Update.Insert ->
-        Log.debug log_bitmex "<- [%s] exec %s" addr symbol;
-        write_order_update ~userid ~username w e
+    let execType = Option.map (RespObj.string e "execType") ~f:ExecType.of_string in
+    let ordStatus = Option.map (RespObj.string e "ordStatus") ~f:OrdStatus.of_string in
+    Log.debug log_bitmex "<- [%s] exec %s" addr symbol;
+    begin match execType, ordStatus with
+    | Some Trade, Some Filled -> TradeHistory.set e
     | _ -> ()
+    end ;
+    write_order_update ~userid ~username w e ;
   in
   List.iter execs ~f:iter_f
 
@@ -794,7 +806,7 @@ let client_ws ({ Connection.addr; w; ws_r; key; secret; order; margin; position 
     | "order", action, orders -> process_orders c order_iv action orders ;
     | "margin", action, margins -> process_margins c margin_iv action margins ;
     | "position", action, positions -> process_positions c position_iv action positions ;
-    | "execution", action, execs -> process_execs c action execs
+    | "execution", action, execs -> process_execs c execs
     | table, _, _ -> Log.error log_bitmex "Unknown table %s" table
   in
   let start = populate_api_keys c in
