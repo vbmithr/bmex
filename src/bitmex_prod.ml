@@ -465,9 +465,9 @@ module TradeHistory = struct
             ~f:(fun ~key ~data a -> String.Map.add ~key ~data a)
     end
 
-  let set trade =
-    let userid = RespObj.int_exn trade "account" in
+  let set ~userid ~username trade =
     let orderID = RespObj.string_exn trade "orderID" in
+    let trade = add_tradeAccount ~userid ~username trade in
     String.Table.set trades_by_uuid orderID trade ;
     let data = Option.value_map (Int.Table.find table userid)
         ~default:(String.Map.singleton orderID trade)
@@ -789,7 +789,7 @@ let process_execs { Connection.addr ; w ; usernames } execs =
     let ordStatus = Option.map (RespObj.string e "ordStatus") ~f:OrdStatus.of_string in
     Log.debug log_bitmex "<- [%s] exec %s" addr symbol;
     begin match execType, ordStatus with
-    | Some Trade, Some Filled -> TradeHistory.set e
+    | Some Trade, Some Filled -> TradeHistory.set ~userid ~username e
     | _ -> ()
     end ;
     write_order_update ~userid ~username w e ;
