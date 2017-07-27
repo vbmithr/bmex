@@ -1731,7 +1731,7 @@ let clients_topics = Bmex_ws.Topic.[Order; Execution; Position; Margin]
 
 let on_ws_msg to_ws_w my_uuid msg =
   let open Bmex_ws in
-  match MD.of_yojson msg with
+  match MD.of_yojson ~log:log_bitmex msg with
   | Subscribe _ -> ()
   | Unsubscribe { id ; topic } -> begin
       match conn_userid_of_stream_id_exn id with
@@ -1743,7 +1743,7 @@ let on_ws_msg to_ws_w my_uuid msg =
             (Unsubscribe { addr = conn.addr ; id })
     end
   | Message { stream = { id ; topic } ; payload } -> begin
-      match Response.of_yojson payload, conn_userid_of_stream_id_exn id with
+      match Response.of_yojson ~log:log_bitmex payload, conn_userid_of_stream_id_exn id with
       (* Server *)
       | Response.Welcome _, None ->
           Pipe.write_without_pushback to_ws_w @@
