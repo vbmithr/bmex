@@ -1233,30 +1233,38 @@ let current_positions_request addr w msg =
     write_no_positions ?trade_account:req.trade_account ?request_id:req.request_id w ;
   Log.debug log_dtc "-> [%s] Current Positions Request: %d positions" addr nb_msgs
 
-let send_historical_order_fills_response req addr w trades =
+let send_historical_order_fill
+    (resp : DTC.Historical_order_fill_response.t) w t message_number =
   let open RespObj in
+  let side = string_exn t "side" |> Side.of_string in
+  resp.trade_account <- Some (string_exn t "tradeAccount") ;
+  resp.message_number <- Some message_number ;
+  resp.symbol <- Some (string_exn t "symbol") ;
+  resp.exchange <- Some !my_exchange ;
+  resp.server_order_id <- Some (string_exn t "orderID") ;
+  resp.price <- Some (float_exn t "avgPx") ;
+  resp.quantity <- Some Float.(of_int64 (int64_exn t "orderQty")) ;
+  resp.date_time <-
+    string t "transactTime" |>
+    Option.map ~f:(Fn.compose seconds_int64_of_ts Time_ns.of_string) ;
+  resp.buy_sell <- Some side ;
+  resp.unique_execution_id <- Some (string_exn t "execID") ;
+  write_message w `historical_order_fill_response
+    DTC.gen_historical_order_fill_response resp ;
+  Int32.succ message_number
+
+let send_historical_order_fills_response req addr w trades =
   let resp = DTC.default_historical_order_fill_response () in
   let nb_msgs = String.Map.length trades in
   resp.total_number_messages <- Some (Int32.of_int_exn nb_msgs) ;
   resp.request_id <- req.DTC.Historical_order_fills_request.request_id ;
-  String.Map.fold trades ~init:1l ~f:begin fun ~key:_ ~data:t message_number ->
-    let side = string_exn t "side" |> Side.of_string in
-    resp.trade_account <- Some (string_exn t "tradeAccount") ;
-    resp.message_number <- Some message_number ;
-    resp.symbol <- Some (string_exn t "symbol") ;
-    resp.exchange <- Some !my_exchange ;
-    resp.server_order_id <- Some (string_exn t "orderID") ;
-    resp.price <- Some (float_exn t "avgPx") ;
-    resp.quantity <- Some Float.(of_int64 (int64_exn t "orderQty")) ;
-    resp.date_time <-
-      string t "transactTime" |>
-      Option.map ~f:(Fn.compose seconds_int64_of_ts Time_ns.of_string) ;
-    resp.buy_sell <- Some side ;
-    resp.unique_execution_id <- Some (string_exn t "execID") ;
-    write_message w `historical_order_fill_response
-      DTC.gen_historical_order_fill_response resp ;
-    Int32.succ message_number
-  end |> fun _ ->
+  let _ = String.Map.fold trades ~init:1l ~f:begin fun ~key:_ ~data:t a ->
+      try
+        send_historical_order_fill resp w t a
+      with _ ->
+        Log.error log_bitmex "%s" (RespObj.to_string t);
+        a
+    end in
   Log.debug log_dtc "-> [%s] Historical Order Fills Response (%d fills)" addr nb_msgs
 
 let reject_historical_order_fills_request ?request_id w k =
