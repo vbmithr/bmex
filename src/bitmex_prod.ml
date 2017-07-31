@@ -516,6 +516,9 @@ let status_reason_of_execType_ordStatus e =
 
 let write_order_update ?request_id ?(nb_msgs=1) ?(msg_number=1) ~userid ~username ~status ~reason w o =
   let open RespObj in
+  let cumQty = Option.map (int64 o "cumQty") ~f:Int64.to_float in
+  let leavesQty = Option.map (int64 o "leavesQty") ~f:Int64.to_float in
+  let orderQty = Option.map2 cumQty leavesQty ~f:Float.add in
   let u = DTC.default_order_update () in
   let price = float_or_null_exn ~default:Float.max_finite_value o "price" in
   let stopPx = float_or_null_exn ~default:Float.max_finite_value o "stopPx" in
@@ -541,9 +544,9 @@ let write_order_update ?request_id ?(nb_msgs=1) ?(msg_number=1) ~userid ~usernam
   u.price1 <- p1 ;
   u.price2 <- p2 ;
   u.time_in_force <- timeInForce ;
-  u.order_quantity <- Option.map (int64 o "orderQty") ~f:Int64.to_float ;
-  u.filled_quantity <- Option.map (int64 o "cumQty") ~f:Int64.to_float ;
-  u.remaining_quantity <- Option.map (int64 o "leavesQty") ~f:Int64.to_float ;
+  u.order_quantity <- orderQty ;
+  u.filled_quantity <- cumQty ;
+  u.remaining_quantity <- leavesQty ;
   u.average_fill_price <- (float o "avgPx") ;
   u.last_fill_price <- (float o "lastPx") ;
   u.last_fill_date_time <- ts ;
@@ -1237,13 +1240,17 @@ let send_historical_order_fill
     (resp : DTC.Historical_order_fill_response.t) w t message_number =
   let open RespObj in
   let side = string_exn t "side" |> Side.of_string in
+  let cumQty = int64 t "cumQty" in
+  let leavesQty = int64 t "leavesQty" in
+  let orderQty =
+    Option.map2 cumQty leavesQty ~f:Int64.(fun a b -> to_float (a + b)) in
   resp.trade_account <- Some (string_exn t "tradeAccount") ;
   resp.message_number <- Some message_number ;
   resp.symbol <- Some (string_exn t "symbol") ;
   resp.exchange <- Some !my_exchange ;
   resp.server_order_id <- Some (string_exn t "orderID") ;
   resp.price <- Some (float_exn t "avgPx") ;
-  resp.quantity <- Some Float.(of_int64 (int64_exn t "orderQty")) ;
+  resp.quantity <- orderQty ;
   resp.date_time <-
     string t "transactTime" |>
     Option.map ~f:(Fn.compose seconds_int64_of_ts Time_ns.of_string) ;
