@@ -37,9 +37,8 @@ cd bmex_dtc
 
 # Install ocaml deps
 opam pin --dev-repo ocplib-json-typed
-opam install astring async_ssl base64 cmdliner cstruct digestif
-             fmt hex jsonm leveldb logs magic-mime ocplib-endian
-             piqi uri yojson
+opam install cohttp-async astring async_ssl cmdliner cstruct digestif
+             hex leveldb ocplib-endian piqi yojson
 
 # Build the project
 make
@@ -58,10 +57,7 @@ Sierra Chart expects bmex to run on port 5567 with TLS enabled.
 git submodule update --remote bmex
 git submodule update --remote bs_devkit
 git submodule update --remote ocaml-bmex
-git submodule update --remote ocaml-cohttp
-git submodule update --remote ocaml-conduit
 git submodule update --remote ocaml-dtc-pb
-git submodule update --remote ocaml-ipaddr
 git submodule update --remote ocaml-scid
 git submodule update --remote ocaml-tick
 git submodule update --remote ocaml-websocket
