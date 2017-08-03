@@ -1166,23 +1166,25 @@ let reject_open_orders_request ?request_id w k =
 
 let open_orders_request addr w msg =
   let conn = Connection.find_exn addr in
-  Log.debug log_dtc "<- [%s] Open Orders Request" addr ;
   let req = DTC.parse_open_orders_request msg in
   let trade_account = Option.value ~default:"" req.trade_account in
+  Log.debug log_dtc "<- [%s] Open Orders Request (%s)" addr trade_account ;
   let user_id = Option.(cut_trade_account trade_account >>| snd) in
   let order_id = Option.bind req.server_order_id
       ~f:(function "" -> None | uuid -> Some (Uuid.of_string uuid)) in
   match get_open_orders ?user_id ?order_id conn.Connection.order with
   | [] ->
       write_empty_order_update ?request_id:req.request_id w ;
-      Log.debug log_bitmex "[%s] -> Open Orders Response: No Open Orders" addr
+      Log.debug log_bitmex
+        "[%s] -> Open Orders Response (%s): No Open Orders" trade_account addr
   | oos ->
       let nb_msgs = List.length oos in
       List.iteri oos ~f:begin fun i (status, o) ->
         write_open_order_update ?request_id:req.request_id ~nb_msgs ~msg_number:(succ i)
           ~status ~conn ~w o
       end ;
-      Log.debug log_bitmex "[%s] -> Open Orders Response: %d Open Orders" addr nb_msgs
+      Log.debug log_bitmex
+        "[%s] -> Open Orders Response (%s): %d Open Orders" addr trade_account nb_msgs
 
 let write_current_position_update ?request_id ~msg_number ~nb_msgs ~conn ~w p =
   let userid = RespObj.int_exn p "account" in
@@ -1212,9 +1214,9 @@ let get_open_positions position userid =
 
 let current_positions_request addr w msg =
   let ({ Connection.addr ; position } as conn) = Connection.find_exn addr in
-  Log.debug log_dtc "<- [%s] Current Positions Request" addr ;
   let req = DTC.parse_current_positions_request msg in
   let trade_account = Option.value ~default:"" req.trade_account in
+  Log.debug log_dtc "<- [%s] Current Positions Request (%s)" addr trade_account ;
   let userid = Option.map (cut_trade_account trade_account) ~f:snd in
   let nb_msgs, open_positions = get_open_positions position userid in
   List.iteri open_positions ~f:begin fun i p ->
@@ -1223,7 +1225,8 @@ let current_positions_request addr w msg =
   end ;
   if nb_msgs = 0 then
     write_no_positions ?trade_account:req.trade_account ?request_id:req.request_id w ;
-  Log.debug log_dtc "-> [%s] Current Positions Request: %d positions" addr nb_msgs
+  Log.debug log_dtc
+    "-> [%s] Current Positions Request (%s): %d positions" addr trade_account nb_msgs
 
 let send_historical_order_fill
     (resp : DTC.Historical_order_fill_response.t) w t message_number =
@@ -1249,7 +1252,7 @@ let send_historical_order_fill
     DTC.gen_historical_order_fill_response resp ;
   Int32.succ message_number
 
-let send_historical_order_fills_response req addr w trades =
+let send_historical_order_fills_response req addr trade_account w trades =
   let resp = DTC.default_historical_order_fill_response () in
   let nb_msgs = String.Map.length trades in
   resp.total_number_messages <- Some (Int32.of_int_exn nb_msgs) ;
@@ -1261,7 +1264,8 @@ let send_historical_order_fills_response req addr w trades =
         Log.error log_bitmex "%s" (RespObj.to_string t);
         a
     end in
-  Log.debug log_dtc "-> [%s] Historical Order Fills Response (%d fills)" addr nb_msgs
+  Log.debug log_dtc
+    "-> [%s] Historical Order Fills Response (%s) (%d fills)" addr trade_account nb_msgs
 
 let reject_historical_order_fills_request ?request_id w k =
   let rej = DTC.default_historical_order_fills_reject () in
@@ -1285,17 +1289,17 @@ let write_no_historical_order_fills req w =
 
 let historical_order_fills_request addr w msg =
     let ({ Connection.apikeys ; usernames } as conn) = Connection.find_exn addr in
-    Log.debug log_dtc "<- [%s] Historical Order Fills Request" addr ;
     let req = DTC.parse_historical_order_fills_request msg in
     let orderID = Option.value ~default:"" req.server_order_id in
     let trade_account = Option.value ~default:"" req.trade_account in
+    Log.debug log_dtc "<- [%s] Historical Order Fills Request (%s)" addr trade_account ;
     match orderID, Option.map (cut_trade_account trade_account) ~f:snd with
     | "", None -> don't_wait_for begin
         TradeHistory.get_all conn >>| function
         | trades when String.Map.is_empty trades ->
             write_no_historical_order_fills req w
         | trades ->
-            send_historical_order_fills_response req addr w trades
+            send_historical_order_fills_response req addr trade_account w trades
       end
     | "", Some userid -> begin
         match Int.Table.find apikeys userid with
@@ -1309,7 +1313,7 @@ let historical_order_fills_request addr w msg =
               | Ok trades when String.Map.is_empty trades ->
                   write_no_historical_order_fills req w
               | Ok trades ->
-                  send_historical_order_fills_response req addr w trades
+                  send_historical_order_fills_response req addr trade_account w trades
             end
         | None ->
             reject_historical_order_fills_request ?request_id:req.request_id w
@@ -1319,7 +1323,7 @@ let historical_order_fills_request addr w msg =
         match TradeHistory.get_one orderID with
         | None -> write_no_historical_order_fills req w
         | Some t ->
-            send_historical_order_fills_response req addr w
+            send_historical_order_fills_response req addr trade_account w
               (String.Map.singleton orderID t)
 
 let trade_accounts_request addr w msg =
