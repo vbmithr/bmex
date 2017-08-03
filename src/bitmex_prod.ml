@@ -806,11 +806,12 @@ let client_ws ({ Connection.addr; w; ws_r; key; secret; order; margin; position 
 
   let on_update { Connection.userid ; update={ WS.Response.Update.table; action; data } } =
     match table, action, data with
-    | "order", action, orders -> process_orders c order_iv action orders ;
-    | "margin", action, margins -> process_margins c margin_iv action margins ;
-    | "position", action, positions -> process_positions c position_iv action positions ;
-    | "execution", action, execs -> process_execs c execs
-    | table, _, _ -> Log.error log_bitmex "Unknown table %s" table
+    | Order, action, orders -> process_orders c order_iv action orders ;
+    | Margin, action, margins -> process_margins c margin_iv action margins ;
+    | Position, action, positions -> process_positions c position_iv action positions ;
+    | Execution, action, execs -> process_execs c execs
+    | table, _, _ ->
+        Log.error log_bitmex "Unknown table %s" (Bmex_ws.Topic.to_string table)
   in
   let start = populate_api_keys c in
   Clock_ns.every
@@ -1679,16 +1680,16 @@ let close_bitmex_ws { ws } = Pipe.close_read ws
 
 let on_update { Bmex_ws.Response.Update.table ; action ; data } =
   match action, table, data with
-  | Update, "instrument", instrs ->
+  | Update, Instrument, instrs ->
     if Ivar.is_full Instrument.initialized then
       List.iter instrs ~f:Instrument.update
-  | Delete, "instrument", instrs ->
+  | Delete, Instrument, instrs ->
     if Ivar.is_full Instrument.initialized then
       List.iter instrs ~f:Instrument.delete
-  | _, "instrument", instrs ->
+  | _, Instrument, instrs ->
     List.iter instrs ~f:Instrument.insert ;
     Ivar.fill_if_empty Instrument.initialized ()
-  | _, "orderBookL2", depths ->
+  | _, OrderBookL2, depths ->
     let depths = List.map depths ~f:OrderBook.L2.of_yojson in
     let depths = List.group depths
         ~break:(fun { symbol } { symbol=symbol' } -> symbol <> symbol')
@@ -1703,18 +1704,19 @@ let on_update { Bmex_ws.Response.Update.table ; action ; data } =
       end;
       Ivar.fill_if_empty Books.initialized ()
     end
-  | _, "trade", trades ->
+  | _, Trade, trades ->
     let open Trade in
     don't_wait_for begin
       Ivar.read Instrument.initialized >>| fun () ->
       List.iter trades ~f:(Fn.compose update_trade Trade.of_yojson)
     end
-  | _, "quote", quotes ->
+  | _, Quote, quotes ->
     List.iter quotes ~f:(Fn.compose Quotes.update Quote.of_yojson) ;
     Ivar.fill_if_empty Quotes.initialized ()
   | _, table, json ->
     Log.error log_bitmex "Unknown/ignored BitMEX DB table %s or wrong json %s"
-      table Yojson.Safe.(to_string @@ `List json)
+      (Bmex_ws.Topic.to_string table)
+      Yojson.Safe.(to_string @@ `List json)
 
 let subscribe_topics ?(topic="") ~id ~topics =
   let open Bmex_ws in
