@@ -70,8 +70,6 @@ module Connection = struct
     ws_w: client_update Pipe.Writer.t;
     to_bitmex_r: subscribe_msg Pipe.Reader.t;
     to_bitmex_w: subscribe_msg Pipe.Writer.t;
-    to_client_r: subscribe_msg Pipe.Reader.t;
-    to_client_w: subscribe_msg Pipe.Writer.t;
     key: string;
     secret: string;
     position: RespObj.t IS.Table.t; (* indexed by account, symbol *)
@@ -93,7 +91,6 @@ module Connection = struct
   let create ~addr ~w ~key ~secret ~send_secdefs =
     let ws_r, ws_w = Pipe.create () in
     let to_bitmex_r, to_bitmex_w = Pipe.create () in
-    let to_client_r, to_client_w = Pipe.create () in
     {
       addr ;
       w ;
@@ -101,8 +98,6 @@ module Connection = struct
       ws_w ;
       to_bitmex_r ;
       to_bitmex_w ;
-      to_client_r ;
-      to_client_w ;
       key ;
       secret ;
       position = IS.Table.create () ;
@@ -121,10 +116,9 @@ module Connection = struct
       need_resubscribe = false ;
     }
 
-  let purge { ws_r; to_bitmex_r; to_client_r } =
+  let purge { ws_r; to_bitmex_r } =
     Pipe.close_read ws_r;
-    Pipe.close_read to_bitmex_r;
-    Pipe.close_read to_client_r
+    Pipe.close_read to_bitmex_r
 
   let active : t String.Table.t = String.Table.create ()
   let to_alist () = String.Table.to_alist active
@@ -644,7 +638,7 @@ let add_api_keys
 
 let rec populate_api_keys
     ({ Connection.addr ; apikeys ; usernames ; accounts ; need_resubscribe ;
-        to_bitmex_w ; to_client_r } as conn) entries =
+        to_bitmex_w } as conn) entries =
   Log.debug log_bitmex "[%s] Found %d api keys entries"
     addr (List.length entries) ;
   let old_apikeys = Int.Set.of_hashtbl_keys apikeys in
@@ -666,18 +660,12 @@ let rec populate_api_keys
   Deferred.List.iter
     (Int.Set.to_list keys_to_delete) ~how:`Sequential ~f:begin fun id ->
     Log.debug log_bitmex "[%s] Unsubscribe %d" addr id;
-    Pipe.write to_bitmex_w @@ Unsubscribe { addr ; id } >>= fun () ->
-    Pipe.read to_client_r >>| function
-    | `Ok Unsubscribe { id=id'; addr=addr' } when id = id' && addr = addr' -> ()
-    | _ -> failwithf "Unsubscribe %s %d failed" addr id ()
+    Pipe.write to_bitmex_w @@ Unsubscribe { addr ; id }
   end >>= fun () ->
   Deferred.List.iter
     (Int.Set.to_list keys_to_add) ~how:`Sequential ~f:begin fun id ->
     Log.debug log_bitmex "[%s] Subscribe %d" addr id;
-    Pipe.write to_bitmex_w @@ Subscribe { addr ; id } >>= fun () ->
-    Pipe.read to_client_r >>| function
-    | `Ok Subscribe { id=id'; addr=addr' } when id = id' && addr = addr' -> ()
-    | _ -> failwithf "Subscribe %s %d failed" addr id ()
+    Pipe.write to_bitmex_w @@ Subscribe { addr ; id }
   end >>| fun () ->
   conn.need_resubscribe <- false
 
@@ -729,21 +717,21 @@ let process_margins { Connection.addr ; w ; margin ; usernames } partial_iv acti
     let currency = RespObj.string_exn m "currency" in
     match action with
     | WS.Response.Update.Delete ->
-        Log.debug log_bitmex "<- [%s] margin delete" addr ;
-        IS.Table.remove margin (userid, currency)
+        IS.Table.remove margin (userid, currency) ;
+        Log.debug log_bitmex "<- [%s] margin delete" addr
     | Insert | Partial ->
-        Log.debug log_bitmex "<- [%s] margin insert/partial" addr ;
         IS.Table.set margin ~key:(userid, currency) ~data:m ;
-        write_balance_update ~username ~userid w m
+        write_balance_update ~username ~userid w m ;
+        Log.debug log_bitmex "-> [%s] margin (%s:%d)" addr username userid
     | Update ->
-        Log.debug log_bitmex "<- [%s] margin update" addr ;
         if Ivar.is_full partial_iv then begin
           let m = match IS.Table.find margin (userid, currency) with
           | None -> m
           | Some old_m -> RespObj.merge old_m m
           in
           IS.Table.set margin ~key:(userid, currency) ~data:m;
-          write_balance_update ~username ~userid w m
+          write_balance_update ~username ~userid w m ;
+          Log.debug log_bitmex "-> [%s] margin (%s:%d)" addr username userid
         end
   end ;
   if action = Partial then Ivar.fill_if_empty partial_iv ()
@@ -753,30 +741,30 @@ let process_positions { Connection.addr ; w ; position ; usernames } partial_iv 
     let p = RespObj.of_json p_json in
     let userid = RespObj.int_exn p "account" in
     let username = Int.Table.find_exn usernames userid in
-    let s = RespObj.string_exn p "symbol" in
+    let symbol = RespObj.string_exn p "symbol" in
     match action with
     | WS.Response.Update.Delete ->
-        IS.Table.remove position (userid, s);
+        IS.Table.remove position (userid, symbol);
         Log.debug log_bitmex "<- [%s] position delete" addr
     | Insert | Partial ->
-        IS.Table.set position ~key:(userid, s) ~data:p;
+        IS.Table.set position ~key:(userid, symbol) ~data:p;
         if RespObj.bool_exn p "isOpen" then begin
-          Log.debug log_bitmex "<- [%s] position insert/partial" addr ;
           write_position_update ~userid ~username w p;
-          Log.debug log_bitmex "-> [%s] position update (%s:%d)" addr username userid
+          Log.debug log_bitmex
+            "-> [%s] position %s (%s:%d)" addr symbol username userid
         end
     | Update ->
         if Ivar.is_full partial_iv then begin
-          let old_p, p = match IS.Table.find position (userid, s) with
+          let old_p, p = match IS.Table.find position (userid, symbol) with
           | None -> None, p
           | Some old_p -> Some old_p, RespObj.merge old_p p
           in
-          IS.Table.set position ~key:(userid, s) ~data:p;
+          IS.Table.set position ~key:(userid, symbol) ~data:p;
           match old_p with
           | Some old_p when RespObj.bool_exn old_p "isOpen" ->
-              Log.debug log_dtc "<- [%s] position update" addr ;
               write_position_update ~userid ~username w p ;
-              Log.debug log_bitmex "-> [%s] position update (%s:%d)" addr username userid;
+              Log.debug log_bitmex
+                "-> [%s] position %s (%s:%d)" addr symbol username userid
           | _ -> ()
         end
   end ;
@@ -1617,11 +1605,11 @@ let dtcserver ~server ~port =
     let cleanup () =
       Log.info log_dtc "client %s disconnected" addr ;
       begin match Connection.find addr with
-      | None -> Deferred.unit
+      | None -> ()
       | Some conn ->
           Connection.purge conn ;
-          Pipe.write client_deleted_w conn
-      end >>= fun () ->
+          Pipe.write_without_pushback client_deleted_w conn
+      end ;
       Connection.remove addr ;
       Deferred.all_unit [Writer.close w; Reader.close r]
     in
@@ -1728,76 +1716,85 @@ let stream_id ~uuid ~addr ~id =
   uuid ^ "|" ^ addr ^ "|" ^ Int.to_string id
 
 let subscribe_client ?(topic="") ~uuid ~addr ~id () =
+  Log.debug log_bitmex "Subscribe Client %s %s %d" uuid addr id ;
   let id = stream_id ~uuid ~addr ~id in
   Bmex_ws.MD.(subscribe ~id ~topic |> to_yojson)
 
 let unsubscribe_client ?(topic="") ~uuid ~addr ~id () =
+  Log.debug log_bitmex "Unsubscribe Client %s %s %d" uuid addr id ;
   let id = stream_id ~uuid ~addr ~id in
   Bmex_ws.MD.(unsubscribe ~id ~topic |> to_yojson)
 
-let conn_userid_of_stream_id_exn stream_id =
+type stream =
+  | Server
+  | Zombie
+  | Client of (Connection.t * int)
+
+let conn_userid_of_stream_id stream_id =
   match String.split ~on:'|' stream_id with
   | [_; addr; userid] ->
-      Option.map (Connection.find addr) ~f:begin fun conn ->
-        conn, Int.of_string userid
-      end
-  | _ -> None
+      Option.value_map ~default:Zombie (Connection.find addr)
+        ~f:(fun conn -> Client (conn, Int.of_string userid))
+  | _ -> Server
 
 let bitmex_topics = Bmex_ws.Topic.[Instrument; Quote; OrderBookL2; Trade]
-let clients_topics = Bmex_ws.Topic.[Order; Execution; Position; Margin]
+let client_topics = Bmex_ws.Topic.[Order; Execution; Position; Margin]
 
 let on_ws_msg to_ws_w my_uuid msg =
   let open Bmex_ws in
   match MD.of_yojson ~log:log_bitmex msg with
   | Subscribe _ -> ()
   | Unsubscribe { id ; topic } -> begin
-      match conn_userid_of_stream_id_exn id with
-      | None ->
-          Log.info log_bitmex
-            "Got Unsubscribe message from client not in table"
-      | Some (conn, id) ->
-          Pipe.write_without_pushback conn.to_client_w
-            (Unsubscribe { addr = conn.addr ; id })
+      match conn_userid_of_stream_id id with
+      | Server -> Log.error log_bitmex "Got Unsubscribe message for server"
+      | Zombie -> Log.debug log_bitmex "Got Unsubscribe message for zombie"
+      | Client (conn, userid) ->
+          Log.debug log_bitmex "Got Unsubscribe message for %s" id
     end
   | Message { stream = { id ; topic } ; payload } -> begin
-      match Response.of_yojson ~log:log_bitmex payload, conn_userid_of_stream_id_exn id with
+      match Response.of_yojson ~log:log_bitmex payload,
+            conn_userid_of_stream_id id with
       (* Server *)
-      | Response.Welcome _, None ->
+      | Response.Welcome _, Server ->
           Pipe.write_without_pushback to_ws_w @@
           MD.to_yojson @@ subscribe_topics my_uuid bitmex_topics
-      | Error err, None ->
+      | Error err, Server ->
           Log.error log_bitmex "BitMEX: error %s" err
-      | Response { subscribe = Some { topic ; symbol = Some sym } }, None ->
+      | Response { subscribe = Some { topic ; symbol = Some sym } }, Server ->
           Log.info log_bitmex
             "BitMEX: subscribed to %s:%s" (Topic.show topic) sym
-      | Response { subscribe = Some { topic; symbol = None }}, None ->
+      | Response { subscribe = Some { topic; symbol = None }}, Server ->
           Log.info log_bitmex
             "BitMEX: subscribed to %s" (Topic.show topic)
-      | Update update, None -> on_update update
+      | Update update, Server -> on_update update
 
       (* Clients *)
-      | Welcome _, Some (conn, userid) ->
+      | Welcome _, Client (conn, userid) ->
           let { ApiKey.key ; secret } =
             Int.Table.find_exn conn.Connection.apikeys userid in
           Pipe.write_without_pushback to_ws_w
             MD.(auth ~id ~topic:"" ~key ~secret |> to_yojson)
-      | Error err, Some (conn, userid) ->
+      | Error err, Client (conn, userid) ->
           Log.error log_bitmex "[%s] %d: error %s" conn.addr userid err ;
-      | Response { request = AuthKey _ ; success}, Some (conn, userid) ->
+      | Response { request = AuthKey _ ; success}, Client (conn, userid) ->
           Log.debug log_bitmex "[%s] %d: subscribe to topics" conn.addr userid;
           Pipe.write_without_pushback to_ws_w @@
-            MD.to_yojson @@ subscribe_topics id clients_topics ;
-          Pipe.write_without_pushback conn.to_client_w @@
-          Subscribe { addr = conn.addr ; id = userid }
-      | Response { subscribe = Some { topic = subscription } }, Some (conn, userid) ->
+          MD.to_yojson @@ subscribe_topics id client_topics
+      | Response { subscribe = Some { topic = subscription } }, Client (conn, userid) ->
           Log.info log_bitmex "[%s] %d: subscribed to %s"
             conn.addr userid (Topic.show subscription)
-      | Response _, Some (conn, userid) ->
+      | Response _, Client (conn, userid) ->
           Log.error log_bitmex "[%s] %d: unexpected response %s"
             conn.addr userid (Yojson.Safe.to_string payload)
-      | Update update, Some (conn, userid) ->
+      | Update update, Client (conn, userid) ->
           let client_update = { Connection.userid ; update } in
           Pipe.write_without_pushback conn.ws_w client_update
+
+      | _, Zombie ->
+          Log.error log_bitmex
+            "Got a message on a zombie subscription, unsubscribing" ;
+          Pipe.write_without_pushback to_ws_w @@
+          Bmex_ws.MD.(unsubscribe ~id ~topic |> to_yojson)
       | _ -> ()
     end
 
@@ -1829,7 +1826,7 @@ let bitmex_ws () =
   don't_wait_for begin
     Pipe.iter client_deleted ~f:begin fun { Connection.addr ; usernames } ->
       let usernames = Int.Table.to_alist usernames in
-      Deferred.List.iter usernames ~how:`Parallel ~f:begin fun (id, _) ->
+      Deferred.List.iter usernames ~how:`Sequential ~f:begin fun (id, _) ->
         Pipe.write to_ws_w (unsubscribe_client ~uuid:my_uuid ~addr ~id ())
       end
     end
