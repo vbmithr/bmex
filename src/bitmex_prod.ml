@@ -85,7 +85,7 @@ module Connection = struct
     apikeys : ApiKey.t Int.Table.t; (* indexed by account *)
     usernames : string Int.Table.t; (* indexed by account *)
     accounts : int String.Table.t; (* indexed by SC username *)
-    mutable need_resubscribe: bool;
+    subscriptions : unit Int.Table.t;
   }
 
   let create ~addr ~w ~key ~secret ~send_secdefs =
@@ -111,9 +111,9 @@ module Connection = struct
       apikeys = Int.Table.create () ;
       usernames = Int.Table.create () ;
       accounts = String.Table.create () ;
+      subscriptions = Int.Table.create () ;
 
       dropped = 0 ;
-      need_resubscribe = false ;
     }
 
   let purge { ws_r; to_bitmex_r } =
@@ -606,11 +606,17 @@ let write_trade_account ?request_id ~message_number ~total_number_messages ~trad
   resp.request_id <- request_id ;
   write_message w `trade_account_response DTC.gen_trade_account_response resp
 
-let write_trade_accounts ?request_id { Connection.addr ; w ; usernames } =
+let write_trade_accounts ?request_id ?filter
+    { Connection.addr ; w ; usernames } =
   let total_number_messages, trade_accounts =
     Int.Table.fold usernames ~init:(0, [])
       ~f:begin fun ~key:userid ~data:username (i, accounts) ->
-        succ i, trade_accountf ~userid ~username :: accounts
+        match filter with
+        | None ->
+            succ i, trade_accountf ~userid ~username :: accounts
+        | Some filter when Int.Set.mem filter userid ->
+            succ i, trade_accountf ~userid ~username :: accounts
+        | _ -> i, accounts
       end in
   List.iteri trade_accounts ~f:begin fun i trade_account ->
     write_trade_account ?request_id
@@ -637,24 +643,19 @@ let add_api_keys
   end
 
 let rec populate_api_keys
-    ({ Connection.addr ; apikeys ; usernames ; accounts ; need_resubscribe ;
-        to_bitmex_w } as conn) entries =
+    ({ Connection.addr ; apikeys ; usernames ;
+       accounts ; subscriptions ; to_bitmex_w } as conn) entries =
   Log.debug log_bitmex "[%s] Found %d api keys entries"
     addr (List.length entries) ;
-  let old_apikeys = Int.Set.of_hashtbl_keys apikeys in
   Int.Table.clear apikeys;
   Int.Table.clear usernames;
   String.Table.clear accounts;
   List.iter entries ~f:(add_api_keys conn);
+  let subscriptions = Int.Set.of_hashtbl_keys subscriptions in
   let new_apikeys = Int.Set.of_hashtbl_keys apikeys in
-  if not @@ Int.Set.equal old_apikeys new_apikeys then
-    write_trade_accounts conn ;
-  let keys_to_delete =
-    if need_resubscribe then Int.Set.empty else
-    Int.Set.diff old_apikeys new_apikeys in
-  let keys_to_add =
-    if need_resubscribe then new_apikeys
-    else Int.Set.diff new_apikeys old_apikeys in
+  let keys_to_delete = Int.Set.diff subscriptions new_apikeys in
+  let keys_to_add = Int.Set.diff new_apikeys subscriptions in
+  write_trade_accounts ~filter:keys_to_add conn ;
   Log.debug log_bitmex "[%s] add %d key(s), delete %d key(s)" addr
     (Int.Set.length keys_to_add) (Int.Set.length keys_to_delete);
   Deferred.List.iter
@@ -666,8 +667,7 @@ let rec populate_api_keys
     (Int.Set.to_list keys_to_add) ~how:`Sequential ~f:begin fun id ->
     Log.debug log_bitmex "[%s] Subscribe %d" addr id;
     Pipe.write to_bitmex_w @@ Subscribe { addr ; id }
-  end >>| fun () ->
-  conn.need_resubscribe <- false
+  end
 
 let populate_api_keys ({ Connection.key ; secret } as conn) =
   REST.ApiKey.dtc ~log:log_bitmex ~key ~secret ~testnet:!use_testnet () |>
@@ -1753,6 +1753,7 @@ let on_ws_msg to_ws_w my_uuid msg =
       | Server -> Log.error log_bitmex "Got Unsubscribe message for server"
       | Zombie -> Log.debug log_bitmex "Got Unsubscribe message for zombie"
       | Client (conn, userid) ->
+          Int.Table.remove conn.subscriptions userid ;
           Log.debug log_bitmex "Got Unsubscribe message for %s" id
     end
   | Message { stream = { id ; topic } ; payload } -> begin
@@ -1781,6 +1782,8 @@ let on_ws_msg to_ws_w my_uuid msg =
       | Error err, Client (conn, userid) ->
           Log.error log_bitmex "[%s] %d: error %s" conn.addr userid err ;
       | Response { request = AuthKey _ ; success}, Client (conn, userid) ->
+          (* Subscription of of userid for conn has succeeded. *)
+          Int.Table.set conn.subscriptions userid () ;
           Log.debug log_bitmex "[%s] %d: subscribe to topics" conn.addr userid;
           Pipe.write_without_pushback to_ws_w @@
           MD.to_yojson @@ subscribe_topics id client_topics
@@ -1810,8 +1813,8 @@ let bitmex_ws () =
   let rec resubscribe () =
     Condition.wait connected >>= fun () ->
     Condition.broadcast ws_feed_connected () ;
-    Connection.iter ~f:(fun c -> c.need_resubscribe <- true);
     Pipe.write to_ws_w MD.(subscribe ~id:my_uuid ~topic:"" |> to_yojson) >>= fun () ->
+    Connection.iter ~f:(fun c -> Int.Table.clear c.subscriptions) ;
     resubscribe ()
   in
   don't_wait_for begin
