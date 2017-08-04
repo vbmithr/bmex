@@ -1553,6 +1553,43 @@ let cancel_order addr w msg =
         let { ApiKey.key ; secret } = Int.Table.find_exn apikeys userid in
         don't_wait_for @@ cancel_order req addr w key secret orderID
 
+let rec handle_chunk addr w consumed buf ~pos ~len =
+  if len < 2 then return @@ `Consumed (consumed, `Need_unknown)
+  else
+  let msglen = Bigstring.unsafe_get_int16_le buf ~pos in
+  (* Log.debug log_dtc "handle_chunk: pos=%d len=%d, msglen=%d" pos len msglen; *)
+  if len < msglen then return @@ `Consumed (consumed, `Need msglen)
+  else begin
+    let msgtype_int = Bigstring.unsafe_get_int16_le buf ~pos:(pos+2) in
+    let msgtype : DTC.dtcmessage_type =
+      DTC.parse_dtcmessage_type (Piqirun.Varint msgtype_int) in
+    let msg_str = Bigstring.To_string.subo buf ~pos:(pos+4) ~len:(msglen-4) in
+    let msg = Piqirun.init_from_string msg_str in
+    begin match msgtype with
+    | `encoding_request ->
+        begin match (Dtc_pb.Encoding.read (Bigstring.To_string.subo buf ~pos ~len:16)) with
+        | None -> Log.error log_dtc "Invalid encoding request received"
+        | Some msg -> encoding_request addr w msg
+        end
+    | `logon_request -> logon_request addr w msg
+    | `heartbeat -> heartbeat addr w msg
+    | `security_definition_for_symbol_request -> security_definition_request addr w msg
+    | `market_data_request -> market_data_request addr w msg
+    | `market_depth_request -> market_depth_request addr w msg
+    | `open_orders_request -> open_orders_request addr w msg
+    | `current_positions_request -> current_positions_request addr w msg
+    | `historical_order_fills_request -> historical_order_fills_request addr w msg
+    | `trade_accounts_request -> trade_accounts_request addr w msg
+    | `account_balance_request -> account_balance_request addr w msg
+    | `submit_new_single_order -> submit_new_single_order addr w msg
+    | `cancel_order -> cancel_order addr w msg
+    | `cancel_replace_order -> cancel_replace_order addr w msg
+    | #DTC.dtcmessage_type ->
+        Log.error log_dtc "Unknown msg type %d" msgtype_int
+    end ;
+    handle_chunk addr w (consumed + msglen) buf (pos + msglen) (len - msglen)
+  end
+
 let dtcserver ~server ~port =
   let server_fun addr r w =
     don't_wait_for begin
@@ -1560,44 +1597,6 @@ let dtcserver ~server ~port =
       Deferred.all_unit [Writer.close w ; Reader.close r]
     end ;
     let addr = Socket.Address.Inet.to_string addr in
-    (* So that process does not allocate all the time. *)
-    let rec handle_chunk consumed buf ~pos ~len =
-      if len < 2 then return @@ `Consumed (consumed, `Need_unknown)
-      else
-        let msglen = Bigstring.unsafe_get_int16_le buf ~pos in
-        (* Log.debug log_dtc "handle_chunk: pos=%d len=%d, msglen=%d" pos len msglen; *)
-        if len < msglen then return @@ `Consumed (consumed, `Need msglen)
-        else begin
-          let msgtype_int = Bigstring.unsafe_get_int16_le buf ~pos:(pos+2) in
-          let msgtype : DTC.dtcmessage_type =
-            DTC.parse_dtcmessage_type (Piqirun.Varint msgtype_int) in
-          let msg_str = Bigstring.To_string.subo buf ~pos:(pos+4) ~len:(msglen-4) in
-          let msg = Piqirun.init_from_string msg_str in
-          begin match msgtype with
-            | `encoding_request ->
-              begin match (Dtc_pb.Encoding.read (Bigstring.To_string.subo buf ~pos ~len:16)) with
-                | None -> Log.error log_dtc "Invalid encoding request received"
-                | Some msg -> encoding_request addr w msg
-              end
-            | `logon_request -> logon_request addr w msg
-            | `heartbeat -> heartbeat addr w msg
-            | `security_definition_for_symbol_request -> security_definition_request addr w msg
-            | `market_data_request -> market_data_request addr w msg
-            | `market_depth_request -> market_depth_request addr w msg
-            | `open_orders_request -> open_orders_request addr w msg
-            | `current_positions_request -> current_positions_request addr w msg
-            | `historical_order_fills_request -> historical_order_fills_request addr w msg
-            | `trade_accounts_request -> trade_accounts_request addr w msg
-            | `account_balance_request -> account_balance_request addr w msg
-            | `submit_new_single_order -> submit_new_single_order addr w msg
-            | `cancel_order -> cancel_order addr w msg
-            | `cancel_replace_order -> cancel_replace_order addr w msg
-            | #DTC.dtcmessage_type ->
-              Log.error log_dtc "Unknown msg type %d" msgtype_int
-          end ;
-          handle_chunk (consumed + msglen) buf (pos + msglen) (len - msglen)
-        end
-    in
     let on_connection_io_error exn =
       Connection.remove addr ;
       Log.error log_dtc "on_connection_io_error (%s): %s" addr Exn.(to_string exn)
@@ -1615,9 +1614,8 @@ let dtcserver ~server ~port =
     in
     Deferred.ignore @@ Monitor.protect ~finally:cleanup begin fun () ->
       Monitor.detach_and_iter_errors Writer.(monitor w) ~f:on_connection_io_error;
-      Reader.(read_one_chunk_at_a_time r ~handle_chunk:(handle_chunk 0))
-    end
-  in
+      Reader.(read_one_chunk_at_a_time r ~handle_chunk:(handle_chunk addr w 0 ))
+    end in
   let on_handler_error_f addr exn =
     Log.error log_dtc "on_handler_error (%s): %s"
       Socket.Address.(to_string addr) Exn.(to_string exn)
