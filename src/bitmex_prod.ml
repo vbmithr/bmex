@@ -606,17 +606,12 @@ let write_trade_account ?request_id ~message_number ~total_number_messages ~trad
   resp.request_id <- request_id ;
   write_message w `trade_account_response DTC.gen_trade_account_response resp
 
-let write_trade_accounts ?request_id ?filter
+let write_trade_accounts ?request_id
     { Connection.addr ; w ; usernames } =
   let total_number_messages, trade_accounts =
     Int.Table.fold usernames ~init:(0, [])
       ~f:begin fun ~key:userid ~data:username (i, accounts) ->
-        match filter with
-        | None ->
-            succ i, trade_accountf ~userid ~username :: accounts
-        | Some filter when Int.Set.mem filter userid ->
-            succ i, trade_accountf ~userid ~username :: accounts
-        | _ -> i, accounts
+        succ i, trade_accountf ~userid ~username :: accounts
       end in
   List.iteri trade_accounts ~f:begin fun i trade_account ->
     write_trade_account ?request_id
@@ -638,7 +633,7 @@ let add_api_keys
     Option.iter sc_account ~f:begin fun sc_account ->
       Int.Table.set usernames userId sc_account ;
       String.Table.set accounts sc_account userId ;
-      Log.debug log_bitmex "[%s] Add key for %s:%d" addr sc_account userId
+      Log.debug log_bitmex "[%s] Found account %s:%d" addr sc_account userId
     end
   end
 
@@ -655,7 +650,8 @@ let rec populate_api_keys
   let new_apikeys = Int.Set.of_hashtbl_keys apikeys in
   let keys_to_delete = Int.Set.diff subscriptions new_apikeys in
   let keys_to_add = Int.Set.diff new_apikeys subscriptions in
-  write_trade_accounts ~filter:keys_to_add conn ;
+  if not Int.Set.(is_empty keys_to_delete && is_empty keys_to_add) then
+    write_trade_accounts conn ;
   Log.debug log_bitmex "[%s] add %d key(s), delete %d key(s)" addr
     (Int.Set.length keys_to_add) (Int.Set.length keys_to_delete);
   Deferred.List.iter
