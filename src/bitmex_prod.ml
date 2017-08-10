@@ -1637,8 +1637,8 @@ let update_trade { Trade.symbol; timestamp; price; size; side } =
     (* Send trade updates to subscribers. *)
     let at_bid_or_ask =
       match side with
-      | `buy -> `at_bid
-      | `sell -> `at_ask
+      | `buy -> `at_ask
+      | `sell -> `at_bid
       | `buy_sell_unset -> `bid_ask_unset in
     let u = DTC.default_market_data_update_trade () in
     u.at_bid_or_ask <- Some at_bid_or_ask ;
