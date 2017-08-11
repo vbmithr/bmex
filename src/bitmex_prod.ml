@@ -547,6 +547,7 @@ let write_order_update ?request_id ?(nb_msgs=1) ?(msg_number=1) ~userid ~usernam
   u.last_fill_quantity <- Option.map ~f:Int64.to_float (int64 o "lastQty") ;
   u.last_fill_execution_id <- string o "execID" ;
   u.trade_account <- Some (trade_accountf ~userid ~username) ;
+  u.info_text <- string o "ordRejReason" ;
   u.free_form_text <- string o "text" ;
   write_message w `order_update DTC.gen_order_update u
 
