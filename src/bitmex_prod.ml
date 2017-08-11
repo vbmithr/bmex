@@ -437,20 +437,29 @@ module TradeHistory = struct
       Int.Table.set table userid trades ;
       Ok trades
 
-  let get { Connection.apikeys ; usernames } ~userid =
+  let filter_trades min_ts trades =
+    String.Map.filter trades ~f:begin fun t ->
+      let ts =
+        Option.value_map (RespObj.string t "transactTime")
+          ~default:Time_ns.max_value ~f:Time_ns.of_string in
+      Time_ns.(ts > min_ts)
+    end
+
+  let get ?(min_ts=Time_ns.epoch) { Connection.apikeys ; usernames } ~userid =
     let { ApiKey.key ; secret } = Int.Table.find_exn apikeys userid in
     let username = Int.Table.find_exn usernames userid in
     match Int.Table.find table userid with
-    | Some trades -> Deferred.Or_error.return trades
-    | None -> get ~userid ~username ~key ~secret
+    | Some trades -> Deferred.Or_error.return (filter_trades min_ts trades)
+    | None ->
+        Deferred.Or_error.(get ~userid ~username ~key ~secret >>| filter_trades min_ts)
 
   let get_one = String.Table.find trades_by_uuid
 
-  let get_all ({ Connection.apikeys ; usernames } as conn) =
+  let get_all ?min_ts ({ Connection.apikeys ; usernames } as conn) =
     let apikeys = Hashtbl.to_alist apikeys in
     Deferred.List.fold apikeys
       ~init:String.Map.empty ~f:begin fun a (userid, _) ->
-      get conn ~userid >>| function
+      get ?min_ts conn ~userid >>| function
       | Error err ->
           Log.error log_bitmex "%s" (Error.to_string_hum err) ;
           a
@@ -1289,10 +1298,13 @@ let historical_order_fills_request addr w msg =
     let req = DTC.parse_historical_order_fills_request msg in
     let orderID = Option.value ~default:"" req.server_order_id in
     let trade_account = Option.value ~default:"" req.trade_account in
+    let min_ts = Option.map req.number_of_days ~f:begin fun i ->
+        Time_ns.(sub (now ()) (Span.of_day (Int32.to_float i)))
+      end in
     Log.debug log_dtc "<- [%s] Historical Order Fills Request (%s)" addr trade_account ;
     match orderID, Option.map (cut_trade_account trade_account) ~f:snd with
     | "", None -> don't_wait_for begin
-        TradeHistory.get_all conn >>| function
+        TradeHistory.get_all ?min_ts conn >>| function
         | trades when String.Map.is_empty trades ->
             write_no_historical_order_fills req w
         | trades ->
@@ -1302,7 +1314,7 @@ let historical_order_fills_request addr w msg =
         match Int.Table.find apikeys userid with
         | Some { key; secret } ->
             don't_wait_for begin
-              TradeHistory.get conn ~userid >>| function
+              TradeHistory.get ?min_ts conn ~userid >>| function
               | Error err ->
                   Log.error log_bitmex "%s" @@ Error.to_string_hum err ;
                   reject_historical_order_fills_request ?request_id:req.request_id w
