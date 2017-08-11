@@ -1471,7 +1471,7 @@ let submit_new_single_order addr w msg =
         Log.error log_bitmex "No API key for %s:%d" username userid
       end ~if_found:begin fun { key; secret } ->
         (* TODO: Enable selection of execInst *)
-        don't_wait_for (submit_order w ~key ~secret req MarkPrice)
+        don't_wait_for (submit_order w ~key ~secret req LastPrice)
       end
 
 let reject_cancel_replace_order (req : DTC.Cancel_replace_order.t) addr w k =
