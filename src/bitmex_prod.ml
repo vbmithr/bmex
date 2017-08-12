@@ -488,35 +488,6 @@ let send_heartbeat { Connection.addr ; w } span =
       write_message w `heartbeat DTC.gen_heartbeat msg
     end
 
-let fail_ordStatus_execType ~ordStatus ~execType =
-  invalid_argf
-    "Wrong ordStatus/execType pair: %s, %s"
-    (OrdStatus.show ordStatus)
-    (ExecType.show execType)
-    ()
-
-let status_reason_of_execType_ordStatus e =
-  let ordStatus = RespObj.(string_exn e "ordStatus") |> OrdStatus.of_string in
-  let execType = RespObj.(string_exn e "execType") |> ExecType.of_string in
-  match ordStatus, execType with
-
-  | New, New
-  | New, TriggeredOrActivatedBySystem -> `order_status_open, `new_order_accepted
-  | New, Replaced -> `order_status_open, `order_cancel_replace_complete
-  | New, Restated -> `order_status_open, `general_order_update
-
-  | PartiallyFilled, Trade -> `order_status_partially_filled, `order_filled_partially
-  | PartiallyFilled, Replaced -> `order_status_partially_filled, `order_cancel_replace_complete
-  | PartiallyFilled, Restated -> `order_status_partially_filled, `general_order_update
-
-  | Filled, Trade -> `order_status_filled, `order_filled
-  | Canceled, Canceled -> `order_status_canceled, `order_canceled
-  | Rejected, Rejected -> `order_status_rejected, `new_order_rejected
-
-  | _, Funding -> raise Exit
-  | _, Settlement -> raise Exit
-  | _ -> fail_ordStatus_execType ~ordStatus ~execType
-
 let write_order_update ?request_id ?(nb_msgs=1) ?(msg_number=1) ~userid ~username ~status ~reason w o =
   let open RespObj in
   let cumQty = Option.map (int64 o "cumQty") ~f:Int64.to_float in
@@ -559,6 +530,35 @@ let write_order_update ?request_id ?(nb_msgs=1) ?(msg_number=1) ~userid ~usernam
   u.info_text <- string o "ordRejReason" ;
   u.free_form_text <- string o "text" ;
   write_message w `order_update DTC.gen_order_update u
+
+let fail_ordStatus_execType ~ordStatus ~execType =
+  invalid_argf
+    "Wrong ordStatus/execType pair: %s, %s"
+    (OrdStatus.show ordStatus)
+    (ExecType.show execType)
+    ()
+
+let status_reason_of_execType_ordStatus e =
+  let ordStatus = RespObj.(string_exn e "ordStatus") |> OrdStatus.of_string in
+  let execType = RespObj.(string_exn e "execType") |> ExecType.of_string in
+  match ordStatus, execType with
+
+  | New, New
+  | New, TriggeredOrActivatedBySystem -> `order_status_open, `new_order_accepted
+  | New, Replaced -> `order_status_open, `order_cancel_replace_complete
+  | New, Restated -> `order_status_open, `general_order_update
+
+  | PartiallyFilled, Trade -> `order_status_partially_filled, `order_filled_partially
+  | PartiallyFilled, Replaced -> `order_status_partially_filled, `order_cancel_replace_complete
+  | PartiallyFilled, Restated -> `order_status_partially_filled, `general_order_update
+
+  | Filled, Trade -> `order_status_filled, `order_filled
+  | Canceled, Canceled -> `order_status_canceled, `order_canceled
+  | Rejected, Rejected -> `order_status_rejected, `new_order_rejected
+
+  | _, Funding -> raise Exit
+  | _, Settlement -> raise Exit
+  | _ -> fail_ordStatus_execType ~ordStatus ~execType
 
 let write_order_update ?request_id ?(nb_msgs=1) ?(msg_number=1) ?status_reason ~userid ~username w o =
   match status_reason with
