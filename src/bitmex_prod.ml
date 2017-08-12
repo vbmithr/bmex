@@ -1101,7 +1101,7 @@ let market_depth_request addr w msg =
   | _ ->
       reject_market_data_request addr w "Market Data Request: wrong request"
 
-let order_is_open o : DTC.order_status_enum option =
+let order_status_if_open o : DTC.order_status_enum option =
   match RespObj.string_exn o "ordStatus" |> OrdStatus.of_string with
   | New -> Some `order_status_open
   | PartiallyFilled -> Some `order_status_partially_filled
@@ -1115,7 +1115,7 @@ let get_open_orders ?user_id ?order_id order_table =
   | None, None ->
       Int.Table.fold order_table ~init:[] ~f:begin fun ~key:uid ~data:orders a ->
         Uuid.Table.fold orders ~init:a ~f:begin fun ~key:oid ~data:o a ->
-          match order_is_open o with
+          match order_status_if_open o with
           | Some status -> (status, o) :: a
           | None -> a
         end
@@ -1125,7 +1125,7 @@ let get_open_orders ?user_id ?order_id order_table =
       | None -> []
       | Some table ->
           Uuid.Table.fold table ~init:[] ~f:begin fun ~key:uid ~data:o a ->
-            match order_is_open o with
+            match order_status_if_open o with
             | Some status -> (status, o) :: a
             | None -> a
           end
@@ -1133,11 +1133,11 @@ let get_open_orders ?user_id ?order_id order_table =
   | Some user_id, Some order_id ->  begin
       Int.Table.find order_table user_id >>= fun table ->
       Uuid.Table.find table order_id >>= fun o ->
-      order_is_open o >>| fun status -> [status, o]
+      order_status_if_open o >>| fun status -> [status, o]
     end |> Option.value ~default:[]
   | None, Some order_id -> begin
       Order.find order_table order_id >>= fun (_uuid, uid, o) ->
-      order_is_open o >>| fun status -> [status, o]
+      order_status_if_open o >>| fun status -> [status, o]
     end |> Option.value ~default:[]
 
 let write_empty_order_update ?request_id w =
