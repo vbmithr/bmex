@@ -568,8 +568,7 @@ let write_order_update ?request_id ?(nb_msgs=1) ?(msg_number=1) ?status_reason ~
       match status_reason_of_execType_ordStatus o with
       | exception Exit -> ()
       | exception Invalid_argument msg ->
-          Log.error log_bitmex "Not sending order update for %s" msg ;
-          ()
+          Log.error log_bitmex "Not sending order update for %s" msg
       | status, reason ->
           write_order_update ?request_id ~status ~reason ~userid ~username w o
 
@@ -1111,6 +1110,7 @@ let order_is_open o : DTC.order_status_enum option =
   | _ -> None
 
 let get_open_orders ?user_id ?order_id order_table =
+  let open Option in
   match user_id, order_id with
   | None, None ->
       Int.Table.fold order_table ~init:[] ~f:begin fun ~key:uid ~data:orders a ->
@@ -1120,8 +1120,8 @@ let get_open_orders ?user_id ?order_id order_table =
           | None -> a
         end
       end
-  | Some user_id, None ->
-      begin match Int.Table.find order_table user_id with
+  | Some user_id, None -> begin
+      match Int.Table.find order_table user_id with
       | None -> []
       | Some table ->
           Uuid.Table.fold table ~init:[] ~f:begin fun ~key:uid ~data:o a ->
@@ -1129,22 +1129,16 @@ let get_open_orders ?user_id ?order_id order_table =
             | Some status -> (status, o) :: a
             | None -> a
           end
-      end
-  | Some user_id, Some order_id ->
-      begin match Int.Table.find order_table user_id with
-      | None -> []
-      | Some table -> begin match Uuid.Table.find table order_id with
-        | None -> []
-        | Some o ->
-            match order_is_open o with None -> [] | Some status -> [status, o]
-        end
-      end
-  | None, Some order_id ->
-      begin match Order.find order_table order_id with
-      | None -> []
-      | Some (_uuid, uid, o) ->
-          match order_is_open o with Some status -> [status, o] | None -> []
-      end
+    end
+  | Some user_id, Some order_id ->  begin
+      Int.Table.find order_table user_id >>= fun table ->
+      Uuid.Table.find table order_id >>= fun o ->
+      order_is_open o >>| fun status -> [status, o]
+    end |> Option.value ~default:[]
+  | None, Some order_id -> begin
+      Order.find order_table order_id >>= fun (_uuid, uid, o) ->
+      order_is_open o >>| fun status -> [status, o]
+    end |> Option.value ~default:[]
 
 let write_empty_order_update ?request_id w =
   let u = DTC.default_order_update () in
