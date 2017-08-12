@@ -53,6 +53,31 @@ module ApiKey = struct
   }
 end
 
+module Feed = struct
+  type t = {
+    order : unit Ivar.t ;
+    margin : unit Ivar.t ;
+    position : unit Ivar.t ;
+  }
+
+  let create () = {
+    order = Ivar.create () ;
+    margin = Ivar.create () ;
+    position = Ivar.create () ;
+  }
+
+  let set_order_ready { order } = Ivar.fill_if_empty order ()
+  let set_margin_ready { margin } = Ivar.fill_if_empty margin ()
+  let set_position_ready { position } = Ivar.fill_if_empty position ()
+
+  let order_ready { order } = Ivar.read order
+  let margin_ready { margin } = Ivar.read margin
+  let position_ready { position } = Ivar.read position
+
+  let ready { order ; margin ; position } =
+    Deferred.all_unit (List.map [ order ; margin ; position ] ~f:Ivar.read)
+end
+
 module Connection = struct
   type subscribe_msg =
     | Subscribe of { addr: string; id: int }
@@ -86,6 +111,7 @@ module Connection = struct
     usernames : string Int.Table.t; (* indexed by account *)
     accounts : int String.Table.t; (* indexed by SC username *)
     subscriptions : unit Int.Table.t;
+    feeds : Feed.t Int.Table.t ;
   }
 
   let create ~addr ~w ~key ~secret ~send_secdefs =
@@ -112,6 +138,7 @@ module Connection = struct
       usernames = Int.Table.create () ;
       accounts = String.Table.create () ;
       subscriptions = Int.Table.create () ;
+      feeds = Int.Table.create () ;
 
       dropped = 0 ;
     }
@@ -648,7 +675,7 @@ let add_api_keys
 
 let rec populate_api_keys
     ({ Connection.addr ; apikeys ; usernames ;
-       accounts ; subscriptions ; to_bitmex_w } as conn) entries =
+       accounts ; subscriptions ; feeds ; to_bitmex_w } as conn) entries =
   Log.debug log_bitmex "[%s] Found %d api keys entries"
     addr (List.length entries) ;
   Int.Table.clear apikeys;
@@ -665,12 +692,14 @@ let rec populate_api_keys
     (Int.Set.length keys_to_add) (Int.Set.length keys_to_delete);
   Deferred.List.iter
     (Int.Set.to_list keys_to_delete) ~how:`Sequential ~f:begin fun id ->
-    Log.debug log_bitmex "[%s] Unsubscribe %d" addr id;
+    Log.debug log_bitmex "[%s] Unsubscribe %d" addr id ;
+    Int.Table.remove feeds id ;
     Pipe.write to_bitmex_w @@ Unsubscribe { addr ; id }
   end >>= fun () ->
   Deferred.List.iter
     (Int.Set.to_list keys_to_add) ~how:`Sequential ~f:begin fun id ->
     Log.debug log_bitmex "[%s] Subscribe %d" addr id;
+    Int.Table.set feeds id (Feed.create ()) ;
     Pipe.write to_bitmex_w @@ Subscribe { addr ; id }
   end
 
@@ -792,20 +821,19 @@ let process_execs { Connection.addr ; w ; usernames } execs =
   in
   List.iter execs ~f:iter_f
 
-let client_ws ({ Connection.addr; w; ws_r; key; secret; order; margin; position } as c) =
-  let order_iv = Ivar.create () in
-  let margin_iv = Ivar.create () in
-  let position_iv = Ivar.create () in
+let on_client_ws_update
+    c { Connection.userid ; update={ WS.Response.Update.table; action; data } } =
+  let feed =
+    Int.Table.find_or_add c.Connection.feeds userid ~default:Feed.create in
+  match table, action, data with
+  | Order, action, orders -> process_orders c feed.order action orders ;
+  | Margin, action, margins -> process_margins c feed.margin action margins ;
+  | Position, action, positions -> process_positions c feed.position action positions ;
+  | Execution, action, execs -> process_execs c execs
+  | table, _, _ ->
+      Log.error log_bitmex "Unknown table %s" (Bmex_ws.Topic.to_string table)
 
-  let on_update { Connection.userid ; update={ WS.Response.Update.table; action; data } } =
-    match table, action, data with
-    | Order, action, orders -> process_orders c order_iv action orders ;
-    | Margin, action, margins -> process_margins c margin_iv action margins ;
-    | Position, action, positions -> process_positions c position_iv action positions ;
-    | Execution, action, execs -> process_execs c execs
-    | table, _, _ ->
-        Log.error log_bitmex "Unknown table %s" (Bmex_ws.Topic.to_string table)
-  in
+let client_ws ({ Connection.addr; w; ws_r; key; secret; order; margin; position } as c) =
   let start = populate_api_keys c in
   Clock_ns.every
     ~continue_on_error:true
@@ -819,8 +847,10 @@ let client_ws ({ Connection.addr; w; ws_r; key; secret; order; margin; position 
       end
     end ;
   don't_wait_for @@ Monitor.handle_errors
-    (fun () -> Pipe.iter_without_pushback ~continue_on_error:true ws_r ~f:on_update)
-    (fun exn -> Log.error log_bitmex "%s" @@ Exn.to_string exn);
+    (fun () ->
+       Pipe.iter_without_pushback ~continue_on_error:true ws_r ~f:(on_client_ws_update c))
+    (fun exn ->
+       Log.error log_bitmex "%s" @@ Exn.to_string exn);
   start
 
 let new_client_accepted, new_client_accepted_w = Pipe.create ()
@@ -1109,37 +1139,6 @@ let order_status_if_open o : DTC.order_status_enum option =
   | PendingReplace -> Some `order_status_pending_cancel_replace
   | _ -> None
 
-let get_open_orders ?user_id ?order_id order_table =
-  let open Option in
-  match user_id, order_id with
-  | None, None ->
-      Int.Table.fold order_table ~init:[] ~f:begin fun ~key:uid ~data:orders a ->
-        Uuid.Table.fold orders ~init:a ~f:begin fun ~key:oid ~data:o a ->
-          match order_status_if_open o with
-          | Some status -> (status, o) :: a
-          | None -> a
-        end
-      end
-  | Some user_id, None -> begin
-      match Int.Table.find order_table user_id with
-      | None -> []
-      | Some table ->
-          Uuid.Table.fold table ~init:[] ~f:begin fun ~key:uid ~data:o a ->
-            match order_status_if_open o with
-            | Some status -> (status, o) :: a
-            | None -> a
-          end
-    end
-  | Some user_id, Some order_id ->  begin
-      Int.Table.find order_table user_id >>= fun table ->
-      Uuid.Table.find table order_id >>= fun o ->
-      order_status_if_open o >>| fun status -> [status, o]
-    end |> Option.value ~default:[]
-  | None, Some order_id -> begin
-      Order.find order_table order_id >>= fun (_uuid, uid, o) ->
-      order_status_if_open o >>| fun status -> [status, o]
-    end |> Option.value ~default:[]
-
 let write_empty_order_update ?request_id w =
   let u = DTC.default_order_update () in
   u.total_num_messages <- Some 1l ;
@@ -1164,27 +1163,67 @@ let reject_open_orders_request ?request_id w k =
     write_message w `open_orders_reject DTC.gen_open_orders_reject rej
   end k
 
+exception No_such_user
+exception No_such_order
+
+let get_open_orders ?orderID { Connection.order } userID =
+  let open Option in
+  match orderID with
+  | None -> begin
+      match Int.Table.find order userID with
+      | None -> raise No_such_user
+      | Some table ->
+          Uuid.Table.fold table ~init:[] ~f:begin fun ~key:uid ~data:o a ->
+            match order_status_if_open o with
+            | Some status -> (status, o) :: a
+            | None -> a
+          end
+    end
+  | Some order_id -> match begin
+    Int.Table.find order userID >>= fun table ->
+    Uuid.Table.find table order_id >>= fun o ->
+    order_status_if_open o >>| fun status -> [status, o]
+  end with
+  | None -> raise No_such_order
+  | Some v -> v
+
 let open_orders_request addr w msg =
   let conn = Connection.find_exn addr in
   let req = DTC.parse_open_orders_request msg in
   let trade_account = Option.value ~default:"" req.trade_account in
   Log.debug log_dtc "<- [%s] Open Orders Request (%s)" addr trade_account ;
-  let user_id = Option.(cut_trade_account trade_account >>| snd) in
-  let order_id = Option.bind req.server_order_id
+  let userID = Option.(cut_trade_account trade_account >>| snd) in
+  let orderID = Option.bind req.server_order_id
       ~f:(function "" -> None | uuid -> Some (Uuid.of_string uuid)) in
-  match get_open_orders ?user_id ?order_id conn.Connection.order with
-  | [] ->
-      write_empty_order_update ?request_id:req.request_id w ;
-      Log.debug log_bitmex
-        "[%s] -> Open Orders Response (%s): No Open Orders" trade_account addr
-  | oos ->
-      let nb_msgs = List.length oos in
-      List.iteri oos ~f:begin fun i (status, o) ->
-        write_open_order_update ?request_id:req.request_id ~nb_msgs ~msg_number:(succ i)
-          ~status ~conn ~w o
-      end ;
-      Log.debug log_bitmex
-        "[%s] -> Open Orders Response (%s): %d Open Orders" addr trade_account nb_msgs
+  match userID with
+  | None ->
+      reject_open_orders_request ?request_id:req.request_id w
+        "Trade Account must be speficied"
+  | Some userID ->
+      match Int.Table.find conn.feeds userID with
+      | None ->
+          reject_open_orders_request ?request_id:req.request_id w
+            "Internal error: No subscription for user"
+      | Some feed -> don't_wait_for begin
+          Feed.order_ready feed >>| fun () ->
+          match get_open_orders ?orderID conn userID with
+          | exception No_such_user ->
+              reject_open_orders_request ?request_id:req.request_id w "No such user"
+          | exception No_such_order ->
+              reject_open_orders_request ?request_id:req.request_id w "No such order"
+          | [] ->
+              write_empty_order_update ?request_id:req.request_id w ;
+              Log.debug log_bitmex
+                "[%s] -> Open Orders Response (%s): No Open Orders" trade_account addr
+          | oos ->
+              let nb_msgs = List.length oos in
+              List.iteri oos ~f:begin fun i (status, o) ->
+                write_open_order_update ?request_id:req.request_id ~nb_msgs ~msg_number:(succ i)
+                  ~status ~conn ~w o
+              end ;
+              Log.debug log_bitmex
+                "[%s] -> Open Orders Response (%s): %d Open Orders" addr trade_account nb_msgs
+        end
 
 let write_current_position_update ?request_id ~msg_number ~nb_msgs ~conn ~w p =
   let userid = RespObj.int_exn p "account" in
@@ -1820,7 +1859,10 @@ let bitmex_ws () =
     Condition.wait connected >>= fun () ->
     Condition.broadcast ws_feed_connected () ;
     Pipe.write to_ws_w MD.(subscribe ~id:my_uuid ~topic:"" |> to_yojson) >>= fun () ->
-    Connection.iter ~f:(fun c -> Int.Table.clear c.subscriptions) ;
+    Connection.iter ~f:begin fun { subscriptions ; feeds } ->
+      Int.Table.clear subscriptions ;
+      Int.Table.clear feeds
+    end ;
     resubscribe ()
   in
   don't_wait_for begin
