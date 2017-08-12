@@ -1198,19 +1198,29 @@ let open_orders_request addr w msg =
   match userID with
   | None ->
       reject_open_orders_request ?request_id:req.request_id w
-        "Trade Account must be speficied"
+        "Trade Account must be speficied" ;
+      Log.error log_bitmex
+        "[%s] -> Open Orders Response (%s): trade account unspecified"
+        trade_account addr
   | Some userID ->
       match Int.Table.find conn.feeds userID with
       | None ->
           reject_open_orders_request ?request_id:req.request_id w
-            "Internal error: No subscription for user"
+            "Internal error: No subscription for user" ;
+          Log.error log_bitmex
+            "[%s] -> Open Orders Response (%s): internal error no sub for user"
+            trade_account addr
       | Some feed -> don't_wait_for begin
           Feed.order_ready feed >>| fun () ->
           match get_open_orders ?orderID conn userID with
           | exception No_such_user ->
-              reject_open_orders_request ?request_id:req.request_id w "No such user"
+              reject_open_orders_request ?request_id:req.request_id w "No such user" ;
+              Log.debug log_bitmex
+                "[%s] -> Open Orders Response (%s): No such user" trade_account addr
           | exception No_such_order ->
-              reject_open_orders_request ?request_id:req.request_id w "No such order"
+              reject_open_orders_request ?request_id:req.request_id w "No such order" ;
+              Log.debug log_bitmex
+                "[%s] -> Open Orders Response (%s): No such order" trade_account addr
           | [] ->
               write_empty_order_update ?request_id:req.request_id w ;
               Log.debug log_bitmex
