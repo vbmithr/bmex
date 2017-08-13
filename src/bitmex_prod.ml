@@ -1163,29 +1163,26 @@ let reject_open_orders_request ?request_id w k =
     write_message w `open_orders_reject DTC.gen_open_orders_reject rej
   end k
 
-exception No_such_user
 exception No_such_order
 
 let get_open_orders ?orderID { Connection.order } userID =
   let open Option in
   match orderID with
-  | None -> begin
-      match Int.Table.find order userID with
-      | None -> raise No_such_user
-      | Some table ->
-          Uuid.Table.fold table ~init:[] ~f:begin fun ~key:uid ~data:o a ->
-            match order_status_if_open o with
-            | Some status -> (status, o) :: a
-            | None -> a
-          end
-    end
-  | Some order_id -> match begin
-    Int.Table.find order userID >>= fun table ->
-    Uuid.Table.find table order_id >>= fun o ->
-    order_status_if_open o >>| fun status -> [status, o]
-  end with
-  | None -> raise No_such_order
-  | Some v -> v
+  | None ->
+      Int.Table.find_or_add order userID ~default:Uuid.Table.create |>
+      Uuid.Table.fold ~init:[] ~f:begin fun ~key:uid ~data:o a ->
+        match order_status_if_open o with
+        | Some status -> (status, o) :: a
+        | None -> a
+      end
+  | Some order_id ->
+      match begin
+        Int.Table.find order userID >>= fun table ->
+        Uuid.Table.find table order_id >>= fun o ->
+        order_status_if_open o >>| fun status -> [status, o]
+      end with
+      | None -> raise No_such_order
+      | Some v -> v
 
 let open_orders_request addr w msg =
   let conn = Connection.find_exn addr in
@@ -1213,10 +1210,6 @@ let open_orders_request addr w msg =
       | Some feed -> don't_wait_for begin
           Feed.order_ready feed >>| fun () ->
           match get_open_orders ?orderID conn userID with
-          | exception No_such_user ->
-              reject_open_orders_request ?request_id:req.request_id w "No such user" ;
-              Log.debug log_bitmex
-                "[%s] -> Open Orders Response (%s): No such user" trade_account addr
           | exception No_such_order ->
               reject_open_orders_request ?request_id:req.request_id w "No such order" ;
               Log.debug log_bitmex
