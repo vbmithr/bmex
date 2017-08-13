@@ -837,7 +837,7 @@ let client_ws ({ Connection.addr; w; ws_r; key; secret; order; margin; position 
   let start = populate_api_keys c in
   Clock_ns.every
     ~continue_on_error:true
-    ~start:(Deferred.ignore start)
+    ~start:(Time_ns.(Clock_ns.after (Time_ns.Span.of_int_sec 60)))
     ~stop:(Writer.close_started w)
     Time_ns.Span.(of_int_sec 60)
     begin fun () -> don't_wait_for begin
