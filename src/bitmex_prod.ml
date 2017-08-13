@@ -97,8 +97,8 @@ module Connection = struct
     to_bitmex_w: subscribe_msg Pipe.Writer.t;
     key: string;
     secret: string;
-    position: RespObj.t IS.Table.t; (* indexed by account, symbol *)
-    margin: RespObj.t IS.Table.t; (* indexed by account, currency *)
+    position: RespObj.t String.Table.t Int.Table.t; (* indexed by account, symbol *)
+    margin: RespObj.t String.Table.t Int.Table.t; (* indexed by account, currency *)
     order: RespObj.t Uuid.Table.t Int.Table.t; (* indexed by account, then orderID *)
     mutable dropped: int;
     subs: int32 String.Table.t;
@@ -126,8 +126,8 @@ module Connection = struct
       to_bitmex_w ;
       key ;
       secret ;
-      position = IS.Table.create () ;
-      margin = IS.Table.create () ;
+      position = Int.Table.create () ;
+      margin = Int.Table.create () ;
       order = Int.Table.create () ;
       subs = String.Table.create () ;
       rev_subs = Int32.Table.create () ;
@@ -675,6 +675,7 @@ let add_api_keys
 
 let rec populate_api_keys
     ({ Connection.addr ; apikeys ; usernames ;
+       order ; position ; margin ;
        accounts ; subscriptions ; feeds ; to_bitmex_w } as conn) entries =
   Log.debug log_bitmex "[%s] Found %d api keys entries"
     addr (List.length entries) ;
@@ -693,12 +694,18 @@ let rec populate_api_keys
   Deferred.List.iter
     (Int.Set.to_list keys_to_delete) ~how:`Sequential ~f:begin fun id ->
     Log.debug log_bitmex "[%s] Unsubscribe %d" addr id ;
+    Int.Table.remove order id ;
+    Int.Table.remove position id ;
+    Int.Table.remove margin id ;
     Int.Table.remove feeds id ;
     Pipe.write to_bitmex_w @@ Unsubscribe { addr ; id }
   end >>= fun () ->
   Deferred.List.iter
     (Int.Set.to_list keys_to_add) ~how:`Sequential ~f:begin fun id ->
     Log.debug log_bitmex "[%s] Subscribe %d" addr id;
+    Int.Table.set order id (Uuid.Table.create ()) ;
+    Int.Table.set position id (String.Table.create ()) ;
+    Int.Table.set margin id (String.Table.create ()) ;
     Int.Table.set feeds id (Feed.create ()) ;
     Pipe.write to_bitmex_w @@ Subscribe { addr ; id }
   end
@@ -714,8 +721,8 @@ let process_orders { Connection.addr ; w ; order } partial_iv action orders =
     let o = RespObj.of_json o_json in
     let oid_string = RespObj.string_exn o "orderID" in
     let oid = Uuid.of_string oid_string in
-    let account = RespObj.int_exn o "account" in
-    let order = Int.Table.find_or_add ~default:Uuid.Table.create order account in
+    let userid = RespObj.int_exn o "account" in
+    let order = Int.Table.find_or_add ~default:Uuid.Table.create order userid in
     match action with
     | WS.Response.Update.Delete ->
         Uuid.Table.remove order oid;
@@ -726,7 +733,7 @@ let process_orders { Connection.addr ; w ; order } partial_iv action orders =
         let side = RespObj.string_exn o "side" in
         let ordType = RespObj.string_exn o "ordType" in
         Log.debug log_bitmex "<- [%s] order insert/partial %s %d %s %s %s"
-          addr oid_string account symbol side ordType
+          addr oid_string userid symbol side ordType
     | Update ->
         if Ivar.is_full partial_iv then begin
           let data = match Uuid.Table.find order oid with
@@ -738,7 +745,7 @@ let process_orders { Connection.addr ; w ; order } partial_iv action orders =
           let side = RespObj.string_exn data "side" in
           let ordType = RespObj.string_exn data "ordType" in
           Log.debug log_bitmex "<- [%s] order update %s %d %s %s %s"
-            addr oid_string account symbol side ordType
+            addr oid_string userid symbol side ordType
         end
   end ;
   if action = Partial then Ivar.fill_if_empty partial_iv ()
@@ -749,21 +756,22 @@ let process_margins { Connection.addr ; w ; margin ; usernames } partial_iv acti
     let userid = RespObj.int_exn m "account" in
     let username = Int.Table.find_exn usernames userid in
     let currency = RespObj.string_exn m "currency" in
+    let margin = Int.Table.find_or_add ~default:String.Table.create margin userid in
     match action with
     | WS.Response.Update.Delete ->
-        IS.Table.remove margin (userid, currency) ;
+        String.Table.remove margin currency ;
         Log.debug log_bitmex "<- [%s] margin delete" addr
     | Insert | Partial ->
-        IS.Table.set margin ~key:(userid, currency) ~data:m ;
+        String.Table.set margin ~key:currency ~data:m ;
         write_balance_update ~username ~userid w m ;
         Log.debug log_bitmex "-> [%s] margin (%s:%d)" addr username userid
     | Update ->
         if Ivar.is_full partial_iv then begin
-          let m = match IS.Table.find margin (userid, currency) with
+          let m = match String.Table.find margin currency with
           | None -> m
           | Some old_m -> RespObj.merge old_m m
           in
-          IS.Table.set margin ~key:(userid, currency) ~data:m;
+          String.Table.set margin ~key:currency ~data:m;
           write_balance_update ~username ~userid w m ;
           Log.debug log_bitmex "-> [%s] margin (%s:%d)" addr username userid
         end
@@ -776,12 +784,13 @@ let process_positions { Connection.addr ; w ; position ; usernames } partial_iv 
     let userid = RespObj.int_exn p "account" in
     let username = Int.Table.find_exn usernames userid in
     let symbol = RespObj.string_exn p "symbol" in
+    let position = Int.Table.find_or_add ~default:String.Table.create position userid in
     match action with
     | WS.Response.Update.Delete ->
-        IS.Table.remove position (userid, symbol);
+        String.Table.remove position symbol ;
         Log.debug log_bitmex "<- [%s] position delete" addr
     | Insert | Partial ->
-        IS.Table.set position ~key:(userid, symbol) ~data:p;
+        String.Table.set position ~key:symbol ~data:p;
         if RespObj.bool_exn p "isOpen" then begin
           write_position_update ~userid ~username w p;
           Log.debug log_bitmex
@@ -789,11 +798,11 @@ let process_positions { Connection.addr ; w ; position ; usernames } partial_iv 
         end
     | Update ->
         if Ivar.is_full partial_iv then begin
-          let old_p, p = match IS.Table.find position (userid, symbol) with
+          let old_p, p = match String.Table.find position symbol with
           | None -> None, p
           | Some old_p -> Some old_p, RespObj.merge old_p p
           in
-          IS.Table.set position ~key:(userid, symbol) ~data:p;
+          String.Table.set position ~key:symbol ~data:p;
           match old_p with
           | Some old_p when RespObj.bool_exn old_p "isOpen" ->
               write_position_update ~userid ~username w p ;
@@ -1189,17 +1198,16 @@ let open_orders_request addr w msg =
   let req = DTC.parse_open_orders_request msg in
   let trade_account = Option.value ~default:"" req.trade_account in
   Log.debug log_dtc "<- [%s] Open Orders Request (%s)" addr trade_account ;
-  let userID = Option.(cut_trade_account trade_account >>| snd) in
   let orderID = Option.bind req.server_order_id
       ~f:(function "" -> None | uuid -> Some (Uuid.of_string uuid)) in
-  match userID with
+  match cut_trade_account trade_account with
   | None ->
       reject_open_orders_request ?request_id:req.request_id w
         "Trade Account must be speficied" ;
       Log.error log_bitmex
-        "[%s] -> Open Orders Response (%s): trade account unspecified"
+        "[%s] -> Open Orders Reject (%s): trade account unspecified"
         trade_account addr
-  | Some userID ->
+  | Some (_username, userID) ->
       match Int.Table.find conn.feeds userID with
       | None ->
           reject_open_orders_request ?request_id:req.request_id w
@@ -1225,8 +1233,16 @@ let open_orders_request addr w msg =
                   ~status ~conn ~w o
               end ;
               Log.debug log_bitmex
-                "[%s] -> Open Orders Response (%s): %d Open Orders" addr trade_account nb_msgs
+                "[%s] -> Open Orders Response (%s): %d Open Order(s)" addr trade_account nb_msgs
         end
+
+let reject_current_positions_request ?request_id w k =
+  let rej = DTC.default_current_positions_reject () in
+  rej.request_id <- request_id ;
+  Printf.ksprintf begin fun reject_text ->
+    rej.reject_text <- Some reject_text ;
+    write_message w `current_positions_reject DTC.gen_current_positions_reject rej
+  end k
 
 let write_current_position_update ?request_id ~msg_number ~nb_msgs ~conn ~w p =
   let userid = RespObj.int_exn p "account" in
@@ -1243,32 +1259,46 @@ let write_no_positions ?trade_account ?request_id w =
   u.trade_account <- trade_account ;
   write_message w `position_update DTC.gen_position_update u
 
-let get_open_positions position userid =
-  IS.Table.fold position ~init:(0, [])
-    ~f:begin fun ~key:(user_id', symbol) ~data ((nb_open_ps, open_ps) as acc) ->
-      if RespObj.bool_exn data "isOpen" then
-        match userid with
-        | Some user_id when user_id = user_id' -> succ nb_open_ps, data :: open_ps
-        | Some _user_id -> acc
-        | None -> succ nb_open_ps, data :: open_ps
+let get_open_positions position =
+  String.Table.fold position ~init:(0, [])
+    ~f:begin fun ~key:symbol ~data ((nb_open_ps, open_ps) as acc) ->
+      if RespObj.bool_exn data "isOpen" then succ nb_open_ps, data :: open_ps
       else acc
     end
 
 let current_positions_request addr w msg =
-  let ({ Connection.addr ; position } as conn) = Connection.find_exn addr in
+  let ({ Connection.addr ; position ; feeds } as conn) = Connection.find_exn addr in
   let req = DTC.parse_current_positions_request msg in
   let trade_account = Option.value ~default:"" req.trade_account in
   Log.debug log_dtc "<- [%s] Current Positions Request (%s)" addr trade_account ;
-  let userid = Option.map (cut_trade_account trade_account) ~f:snd in
-  let nb_msgs, open_positions = get_open_positions position userid in
-  List.iteri open_positions ~f:begin fun i p ->
-    write_current_position_update ?request_id:req.request_id
-      ~nb_msgs ~msg_number:(succ i) ~conn ~w p
-  end ;
-  if nb_msgs = 0 then
-    write_no_positions ?trade_account:req.trade_account ?request_id:req.request_id w ;
-  Log.debug log_dtc
-    "-> [%s] Current Positions Request (%s): %d positions" addr trade_account nb_msgs
+  match cut_trade_account trade_account with
+  | None ->
+      reject_current_positions_request ?request_id:req.request_id w
+        "Trade Account must be speficied" ;
+      Log.error log_bitmex
+        "[%s] -> Current Positions Reject (%s): trade account unspecified"
+        trade_account addr
+  | Some (_username, userid) ->
+      match Int.Table.find feeds userid with
+      | None ->
+          reject_current_positions_request ?request_id:req.request_id w
+            "Internal error: No subscription for user" ;
+          Log.error log_bitmex
+            "[%s] -> Current Positions Request (%s): internal error no sub for user"
+            trade_account addr
+      | Some feed -> don't_wait_for begin
+          Feed.position_ready feed >>| fun () ->
+          let position = Int.Table.find_or_add position ~default:String.Table.create userid in
+          let nb_msgs, open_positions = get_open_positions position in
+          List.iteri open_positions ~f:begin fun i p ->
+            write_current_position_update ?request_id:req.request_id
+              ~nb_msgs ~msg_number:(succ i) ~conn ~w p
+          end ;
+          if nb_msgs = 0 then
+            write_no_positions ?trade_account:req.trade_account ?request_id:req.request_id w ;
+          Log.debug log_dtc
+            "-> [%s] Current Positions Request (%s): %d positions" addr trade_account nb_msgs
+        end
 
 let send_historical_order_fill
     (resp : DTC.Historical_order_fill_response.t) w t message_number =
@@ -1338,15 +1368,14 @@ let historical_order_fills_request addr w msg =
         Time_ns.(sub (now ()) (Span.of_day (Int32.to_float i)))
       end in
     Log.debug log_dtc "<- [%s] Historical Order Fills Request (%s)" addr trade_account ;
-    match orderID, Option.map (cut_trade_account trade_account) ~f:snd with
-    | "", None -> don't_wait_for begin
-        TradeHistory.get_all ?min_ts conn >>| function
-        | trades when String.Map.is_empty trades ->
-            write_no_historical_order_fills req w
-        | trades ->
-            send_historical_order_fills_response req addr trade_account w trades
-      end
-    | "", Some userid -> begin
+    match orderID, cut_trade_account trade_account with
+    | _, None ->
+      reject_historical_order_fills_request ?request_id:req.request_id w
+        "Trade Account must be speficied" ;
+      Log.error log_bitmex
+        "[%s] -> Historical Order Fills Reject (%s): trade account unspecified"
+        trade_account addr
+    | "", Some (_username, userid) -> begin
         match Int.Table.find apikeys userid with
         | Some { key; secret } ->
             don't_wait_for begin
@@ -1377,13 +1406,12 @@ let trade_accounts_request addr w msg =
   Log.debug log_dtc "<- [%s] Trade Accounts Request" addr ;
   write_trade_accounts ?request_id:req.request_id conn
 
-let reject_account_balance_request ?request_id addr w k =
+let reject_account_balance_request ?request_id w k =
   let rej = DTC.default_account_balance_reject () in
   rej.request_id <- request_id ;
   Printf.ksprintf begin fun reject_text ->
     rej.reject_text <- Some reject_text ;
-    write_message w `account_balance_reject  DTC.gen_account_balance_reject rej ;
-    Log.debug log_dtc "-> [%s] Account Balance Reject" addr ;
+    write_message w `account_balance_reject  DTC.gen_account_balance_reject rej
   end k
 
 let write_no_balances req addr w =
@@ -1398,36 +1426,39 @@ let write_no_balances req addr w =
   Log.debug log_dtc "-> [%s] Account Balance Update: no balances" addr
 
 let account_balance_request addr w msg =
-  let { Connection.addr ; margin ; usernames } = Connection.find_exn addr in
+  let { Connection.addr ; margin ; usernames ; feeds } = Connection.find_exn addr in
   let req = DTC.parse_account_balance_request msg in
   let trade_account = Option.value ~default:"" req.trade_account in
-  Log.debug log_dtc "<- [%s] Account Balance Request" addr ;
-  let nb_msgs = IS.Table.length margin in
-  if nb_msgs = 0 then
-    write_no_balances req addr w
-  else if trade_account = "" then
-    IS.Table.fold margin ~init:1 ~f:begin fun ~key:(userid, currency) ~data:balance msg_number ->
-      Int.Table.find_and_call usernames userid
-        ~if_not_found:ignore
-        ~if_found:begin fun username ->
-          write_balance_update ?request_id:req.request_id ~msg_number ~nb_msgs
-            ~username ~userid w balance ;
-          Log.debug log_dtc "-> [%s] account balance: %s:%d" addr username userid
-        end ;
-      succ msg_number
-    end |> ignore
-  else begin
-    let open Option in
-    match cut_trade_account trade_account >>= fun (username, userid) ->
-      IS.Table.find margin (userid, "XBt") >>| fun obj -> username, userid, obj
-    with
-    | Some (username, userid, balance) ->
-        write_balance_update ?request_id:req.request_id ~msg_number:1 ~nb_msgs:1
-          ~username ~userid w balance ;
-        Log.debug log_dtc "-> [%s] account balance: %s:%d" addr username userid
-    | None ->
-        write_no_balances req addr w
-  end
+  Log.debug log_dtc "<- [%s] Account Balance Request (%s)" addr trade_account ;
+  match cut_trade_account trade_account with
+  | None ->
+      reject_account_balance_request ?request_id:req.request_id w
+        "Trade Account must be speficied" ;
+      Log.error log_bitmex
+        "[%s] -> Account Balance Reject (%s): trade account unspecified"
+        trade_account addr
+  | Some (username, userid) ->
+      match Int.Table.find feeds userid with
+      | None ->
+          reject_account_balance_request ?request_id:req.request_id w
+            "Internal error: No subscription for user" ;
+          Log.error log_bitmex
+            "[%s] -> Account Balance Request (%s): internal error no sub for user"
+            trade_account addr
+      | Some feed -> don't_wait_for begin
+          Feed.margin_ready feed >>| fun () ->
+          let margin =
+            Int.Table.find_or_add margin ~default:String.Table.create userid in
+          match
+            Option.map (String.Table.find margin "XBt") ~f:(fun obj -> username, userid, obj)
+          with
+          | Some (username, userid, balance) ->
+              write_balance_update ?request_id:req.request_id ~msg_number:1 ~nb_msgs:1
+                ~username ~userid w balance ;
+              Log.debug log_dtc "-> [%s] account balance: %s:%d" addr username userid
+          | None ->
+              write_no_balances req addr w
+        end
 
 let reject_order (req : DTC.Submit_new_single_order.t) w k =
   let rej = DTC.default_order_update () in
