@@ -97,8 +97,8 @@ module Connection = struct
     to_bitmex_w: subscribe_msg Pipe.Writer.t;
     key: string;
     secret: string;
-    position: RespObj.t String.Table.t Int.Table.t; (* indexed by account, symbol *)
-    margin: RespObj.t String.Table.t Int.Table.t; (* indexed by account, currency *)
+    position: RespObj.t String.Table.t Int.Table.t; (* indexed by account, then symbol *)
+    margin: RespObj.t String.Table.t Int.Table.t; (* indexed by account, then currency *)
     order: RespObj.t Uuid.Table.t Int.Table.t; (* indexed by account, then orderID *)
     mutable dropped: int;
     subs: int32 String.Table.t;
@@ -1213,7 +1213,7 @@ let open_orders_request addr w msg =
           reject_open_orders_request ?request_id:req.request_id w
             "Internal error: No subscription for user" ;
           Log.error log_bitmex
-            "[%s] -> Open Orders Response (%s): internal error no sub for user"
+            "[%s] -> Open Orders Reject (%s): internal error no sub for user"
             trade_account addr
       | Some feed -> don't_wait_for begin
           Feed.order_ready feed >>| fun () ->
@@ -1284,7 +1284,7 @@ let current_positions_request addr w msg =
           reject_current_positions_request ?request_id:req.request_id w
             "Internal error: No subscription for user" ;
           Log.error log_bitmex
-            "[%s] -> Current Positions Request (%s): internal error no sub for user"
+            "[%s] -> Current Positions Reject (%s): internal error no sub for user"
             trade_account addr
       | Some feed -> don't_wait_for begin
           Feed.position_ready feed >>| fun () ->
@@ -1443,7 +1443,7 @@ let account_balance_request addr w msg =
           reject_account_balance_request ?request_id:req.request_id w
             "Internal error: No subscription for user" ;
           Log.error log_bitmex
-            "[%s] -> Account Balance Request (%s): internal error no sub for user"
+            "[%s] -> Account Balance Reject (%s): internal error no sub for user"
             trade_account addr
       | Some feed -> don't_wait_for begin
           Feed.margin_ready feed >>| fun () ->
@@ -1455,7 +1455,7 @@ let account_balance_request addr w msg =
           | Some (username, userid, balance) ->
               write_balance_update ?request_id:req.request_id ~msg_number:1 ~nb_msgs:1
                 ~username ~userid w balance ;
-              Log.debug log_dtc "-> [%s] account balance: %s:%d" addr username userid
+              Log.debug log_dtc "-> [%s] Account Balance Response: %s:%d" addr username userid
           | None ->
               write_no_balances req addr w
         end
