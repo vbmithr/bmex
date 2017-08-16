@@ -871,24 +871,29 @@ let encoding_request addr w req =
   Writer.write w ;
   Log.debug log_dtc "-> [%s] Encoding Response" addr
 
-let accept_logon_request addr w req conn send_secdefs =
+let accept_logon_request addr w req conn send_secdefs trading_supported =
   let hb_span =
     Option.value_map req.DTC.Logon_request.heartbeat_interval_in_seconds
       ~default:(Time_ns.Span.of_int_sec 10)
       ~f:(fun span -> Time_ns.Span.of_int_sec (Int32.to_int_exn span)) in
+  let result_text =
+    if trading_supported then
+      "Welcome to BitMEX DTC Server for Sierra Chart"
+    else
+    "Welcome to BitMEX DTC Server for Sierra Chart (data only)" in
   let r = DTC.default_logon_response () in
   r.protocol_version <- Some 7l ;
   r.server_name <- Some "BitMEX" ;
   r.result <- Some `logon_success ;
-  r.result_text <- Some "Welcome to BitMEX DTC Server for Sierra Chart" ;
+  r.result_text <- Some result_text ;
   r.symbol_exchange_delimiter <- Some "-" ;
   r.security_definitions_supported <- Some true ;
   r.market_data_supported <- Some true ;
   r.historical_price_data_supported <- Some false ;
   r.market_depth_is_supported <- Some true ;
   r.market_depth_updates_best_bid_and_ask <- Some true ;
-  r.trading_is_supported <- Some true ;
-  r.order_cancel_replace_supported <- Some true ;
+  r.trading_is_supported <- Some trading_supported ;
+  r.order_cancel_replace_supported <- Some trading_supported ;
   r.ocoorders_supported <- Some false ;
   r.bracket_orders_supported <- Some false ;
 
@@ -919,20 +924,24 @@ let logon_request addr w msg =
   let req = DTC.parse_logon_request msg in
   let int1 = Option.value ~default:0l req.integer_1 in
   let send_secdefs = Int32.(bit_and int1 128l <> 0l) in
-  match req.username, req.password with
-  | Some key, Some secret ->
+  let username = Option.value ~default:"" req.username in
+  let password = Option.value ~default:"" req.password in
+  match username, password with
+  | key, secret when key <> "" ->
       let conn = Connection.create ~addr ~w ~key ~secret ~send_secdefs in
       Connection.set ~key:addr ~data:conn;
       don't_wait_for begin
         Pipe.write new_client_accepted_w conn >>= fun () ->
         client_ws conn >>| function
-        | Ok () -> accept_logon_request addr w req conn send_secdefs
+        | Ok () -> accept_logon_request addr w req conn send_secdefs true
         | Error err ->
             Log.error log_bitmex "%s" @@ Error.to_string_hum err ;
             reject_logon_request addr w "Credentials rejected by BitMEX"
       end
   | _ ->
-      reject_logon_request addr w "Username and/or Password not set"
+      let conn = Connection.create ~addr ~w ~key:"" ~secret:"" ~send_secdefs in
+      Connection.set ~key:addr ~data:conn ;
+      accept_logon_request addr w req conn send_secdefs false
 
 let heartbeat addr w msg =
   (* Log.debug log_dtc "<- [%s] Heartbeat" addr *)
