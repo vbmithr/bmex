@@ -1214,8 +1214,7 @@ let open_orders_request addr w msg =
       reject_open_orders_request ?request_id:req.request_id w
         "Trade Account must be speficied" ;
       Log.error log_bitmex
-        "[%s] -> Open Orders Reject (%s): trade account unspecified"
-        trade_account addr
+        "[%s] -> Open Orders Reject : trade account unspecified" addr
   | Some (_username, userID) ->
       match Int.Table.find conn.feeds userID with
       | None ->
@@ -1223,18 +1222,18 @@ let open_orders_request addr w msg =
             "Internal error: No subscription for user" ;
           Log.error log_bitmex
             "[%s] -> Open Orders Reject (%s): internal error no sub for user"
-            trade_account addr
+            addr trade_account
       | Some feed -> don't_wait_for begin
           Feed.order_ready feed >>| fun () ->
           match get_open_orders ?orderID conn userID with
           | exception No_such_order ->
               reject_open_orders_request ?request_id:req.request_id w "No such order" ;
               Log.debug log_bitmex
-                "[%s] -> Open Orders Response (%s): No such order" trade_account addr
+                "[%s] -> Open Orders Response (%s): No such order" addr trade_account
           | [] ->
               write_empty_order_update ?request_id:req.request_id w ;
               Log.debug log_bitmex
-                "[%s] -> Open Orders Response (%s): No Open Orders" trade_account addr
+                "[%s] -> Open Orders Response (%s): No Open Orders" addr trade_account
           | oos ->
               let nb_msgs = List.length oos in
               List.iteri oos ~f:begin fun i (status, o) ->
@@ -1285,8 +1284,7 @@ let current_positions_request addr w msg =
       reject_current_positions_request ?request_id:req.request_id w
         "Trade Account must be speficied" ;
       Log.error log_bitmex
-        "[%s] -> Current Positions Reject (%s): trade account unspecified"
-        trade_account addr
+        "[%s] -> Current Positions Reject: trade account unspecified" addr
   | Some (_username, userid) ->
       match Int.Table.find feeds userid with
       | None ->
@@ -1294,7 +1292,7 @@ let current_positions_request addr w msg =
             "Internal error: No subscription for user" ;
           Log.error log_bitmex
             "[%s] -> Current Positions Reject (%s): internal error no sub for user"
-            trade_account addr
+            addr trade_account
       | Some feed -> don't_wait_for begin
           Feed.position_ready feed >>| fun () ->
           let position = Int.Table.find_or_add position ~default:String.Table.create userid in
@@ -1382,8 +1380,7 @@ let historical_order_fills_request addr w msg =
       reject_historical_order_fills_request ?request_id:req.request_id w
         "Trade Account must be speficied" ;
       Log.error log_bitmex
-        "[%s] -> Historical Order Fills Reject (%s): trade account unspecified"
-        trade_account addr
+        "[%s] -> Historical Order Fills Reject: trade account unspecified" addr
     | "", Some (_username, userid) -> begin
         match Int.Table.find apikeys userid with
         | Some { key; secret } ->
@@ -1444,8 +1441,7 @@ let account_balance_request addr w msg =
       reject_account_balance_request ?request_id:req.request_id w
         "Trade Account must be speficied" ;
       Log.error log_bitmex
-        "[%s] -> Account Balance Reject (%s): trade account unspecified"
-        trade_account addr
+        "[%s] -> Account Balance Reject: trade account unspecified" addr
   | Some (username, userid) ->
       match Int.Table.find feeds userid with
       | None ->
@@ -1453,7 +1449,7 @@ let account_balance_request addr w msg =
             "Internal error: No subscription for user" ;
           Log.error log_bitmex
             "[%s] -> Account Balance Reject (%s): internal error no sub for user"
-            trade_account addr
+            addr trade_account
       | Some feed -> don't_wait_for begin
           Feed.margin_ready feed >>| fun () ->
           let margin =
