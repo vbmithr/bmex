@@ -47,10 +47,41 @@ let log_ws = Log.create ~level:`Error ~on_error:`Raise ~output:Log.Output.[stder
 let ws_feed_connected : unit Condition.t = Condition.create ()
 
 module ApiKey = struct
-  type t = {
-    key: string;
-    secret: string;
-  }
+  module T = struct
+    type t = {
+      id : string ;
+      userId : int ;
+      secret : string ;
+      username : string ;
+    } [@@deriving sexp]
+
+    let compare { id } { id = id2 } = String.compare id id2
+
+    let create ~id ~userId ~secret ~username =
+      { id ; userId ; secret ; username }
+
+    let of_rest { REST.ApiKey.id; secret; permissions; enabled; userId } =
+      match enabled with
+      | false -> None
+      | true ->
+          List.find_map permissions ~f:begin function
+          | Perm _ -> None
+          | Dtc username ->
+              Some (create ~id ~secret ~userId ~username)
+          end
+  end
+
+  include T
+  module Set = struct
+    include Set.Make(T)
+
+    let of_rest entries =
+      List.fold_left entries ~init:empty ~f:begin fun a e ->
+        match of_rest e with
+        | None -> a
+        | Some apikey -> add a apikey
+      end
+  end
 end
 
 module Feed = struct
@@ -107,7 +138,8 @@ module Connection = struct
     rev_subs_depth: string Int32.Table.t ;
     send_secdefs: bool;
 
-    apikeys : ApiKey.t Int.Table.t; (* indexed by account *)
+    mutable all_apikeys : ApiKey.Set.t ;
+    apikeys : ApiKey.t Int.Table.t ; (* indexed by account *)
     usernames : string Int.Table.t; (* indexed by account *)
     accounts : int String.Table.t; (* indexed by SC username *)
     subscriptions : unit Int.Table.t;
@@ -134,6 +166,8 @@ module Connection = struct
       subs_depth = String.Table.create () ;
       rev_subs_depth = Int32.Table.create () ;
       send_secdefs ;
+
+      all_apikeys = ApiKey.Set.empty ;
       apikeys = Int.Table.create () ;
       usernames = Int.Table.create () ;
       accounts = String.Table.create () ;
@@ -444,11 +478,11 @@ module TradeHistory = struct
     String.Map.add ~key:"tradeAccount"
       ~data:(`String (trade_accountf ~userid ~username))
 
-  let get ~userid ~username ~key ~secret =
+  let get ~userid ~username ~id ~secret =
     let filter = `Assoc ["execType", `String "Trade"] in
     REST.Execution.trade_history ~count:500
       ~buf ~log:log_bitmex ~testnet:!use_testnet
-      ~filter ~key ~secret () >>| function
+      ~filter ~key:id ~secret () >>| function
     | Error err ->
       Log.error log_bitmex "%s" (Error.to_string_hum err) ;
       Error err
@@ -473,12 +507,12 @@ module TradeHistory = struct
     end
 
   let get ?(min_ts=Time_ns.epoch) { Connection.apikeys ; usernames } ~userid =
-    let { ApiKey.key ; secret } = Int.Table.find_exn apikeys userid in
+    let { ApiKey.id ; secret } = Int.Table.find_exn apikeys userid in
     let username = Int.Table.find_exn usernames userid in
     match Int.Table.find table userid with
     | Some trades -> Deferred.Or_error.return (filter_trades min_ts trades)
     | None ->
-        Deferred.Or_error.(get ~userid ~username ~key ~secret >>| filter_trades min_ts)
+        Deferred.Or_error.(get ~userid ~username ~id ~secret >>| filter_trades min_ts)
 
   let get_one = String.Table.find trades_by_uuid
 
@@ -658,56 +692,48 @@ let write_trade_accounts ?request_id
 
 let add_api_keys
     { Connection.addr; apikeys; usernames; accounts }
-    { REST.ApiKey.id; secret; permissions; enabled; userId } =
-  if enabled then begin
-    Int.Table.set apikeys ~key:userId ~data:{ key = id ; secret };
-    let sc_account = List.find_map permissions ~f:begin function
-      | Dtc username -> Some username
-      | Perm _ -> None
-      end
-    in
-    Option.iter sc_account ~f:begin fun sc_account ->
-      Int.Table.set usernames userId sc_account ;
-      String.Table.set accounts sc_account userId ;
-      Log.debug log_bitmex "[%s] Found account %s:%d" addr sc_account userId
-    end
-  end
+    ({ ApiKey.id ; secret ; userId ; username } as apikey) =
+  Int.Table.set apikeys ~key:userId ~data:apikey ;
+  Int.Table.set usernames userId username ;
+  String.Table.set accounts username userId ;
+  Log.debug log_bitmex "[%s] Found account %s:%d" addr username userId
 
 let rec populate_api_keys
-    ({ Connection.addr ; apikeys ; usernames ;
+    ({ Connection.addr ; apikeys ; usernames ; all_apikeys ;
        order ; position ; margin ;
-       accounts ; subscriptions ; feeds ; to_bitmex_w } as conn) entries =
+       accounts ; feeds ; to_bitmex_w } as conn) entries =
   Log.debug log_bitmex "[%s] Found %d api keys entries"
     addr (List.length entries) ;
+  let new_apikeys = ApiKey.Set.of_rest entries in
+  let keys_to_add = ApiKey.Set.diff new_apikeys all_apikeys in
+  let keys_to_delete = ApiKey.Set.diff all_apikeys new_apikeys in
+  conn.all_apikeys <- new_apikeys ;
   Int.Table.clear apikeys;
   Int.Table.clear usernames;
   String.Table.clear accounts;
-  List.iter entries ~f:(add_api_keys conn);
-  let subscriptions = Int.Set.of_hashtbl_keys subscriptions in
-  let new_apikeys = Int.Set.of_hashtbl_keys apikeys in
-  let keys_to_delete = Int.Set.diff subscriptions new_apikeys in
-  let keys_to_add = Int.Set.diff new_apikeys subscriptions in
-  if not Int.Set.(is_empty keys_to_delete && is_empty keys_to_add) then
+  ApiKey.Set.iter new_apikeys ~f:(add_api_keys conn) ;
+  if not ApiKey.Set.(is_empty keys_to_delete && is_empty keys_to_add) then
     write_trade_accounts conn ;
   Log.debug log_bitmex "[%s] add %d key(s), delete %d key(s)" addr
-    (Int.Set.length keys_to_add) (Int.Set.length keys_to_delete);
+    (ApiKey.Set.length keys_to_add)
+    (ApiKey.Set.length keys_to_delete);
   Deferred.List.iter
-    (Int.Set.to_list keys_to_delete) ~how:`Sequential ~f:begin fun id ->
-    Log.debug log_bitmex "[%s] Unsubscribe %d" addr id ;
-    Int.Table.remove order id ;
-    Int.Table.remove position id ;
-    Int.Table.remove margin id ;
-    Int.Table.remove feeds id ;
-    Pipe.write to_bitmex_w @@ Unsubscribe { addr ; id }
+    (ApiKey.Set.to_list keys_to_delete) ~how:`Sequential ~f:begin fun { userId } ->
+    Log.debug log_bitmex "[%s] Unsubscribe %d" addr userId ;
+    Int.Table.remove order userId ;
+    Int.Table.remove position userId ;
+    Int.Table.remove margin userId ;
+    Int.Table.remove feeds userId ;
+    Pipe.write to_bitmex_w @@ Unsubscribe { addr ; id = userId }
   end >>= fun () ->
   Deferred.List.iter
-    (Int.Set.to_list keys_to_add) ~how:`Sequential ~f:begin fun id ->
-    Log.debug log_bitmex "[%s] Subscribe %d" addr id;
-    Int.Table.set order id (Uuid.Table.create ()) ;
-    Int.Table.set position id (String.Table.create ()) ;
-    Int.Table.set margin id (String.Table.create ()) ;
-    Int.Table.set feeds id (Feed.create ()) ;
-    Pipe.write to_bitmex_w @@ Subscribe { addr ; id }
+    (ApiKey.Set.to_list keys_to_add) ~how:`Sequential ~f:begin fun { userId } ->
+    Log.debug log_bitmex "[%s] Subscribe %d" addr userId;
+    Int.Table.set order userId (Uuid.Table.create ()) ;
+    Int.Table.set position userId (String.Table.create ()) ;
+    Int.Table.set margin userId (String.Table.create ()) ;
+    Int.Table.set feeds userId (Feed.create ()) ;
+    Pipe.write to_bitmex_w @@ Subscribe { addr ; id = userId }
   end
 
 let populate_api_keys ({ Connection.key ; secret } as conn) =
@@ -1383,7 +1409,7 @@ let historical_order_fills_request addr w msg =
         "[%s] -> Historical Order Fills Reject: trade account unspecified" addr
     | "", Some (_username, userid) -> begin
         match Int.Table.find apikeys userid with
-        | Some { key; secret } ->
+        | Some { id ; secret } ->
             don't_wait_for begin
               TradeHistory.get ?min_ts conn ~userid >>| function
               | Error err ->
@@ -1541,9 +1567,9 @@ let submit_new_single_order addr w msg =
       Int.Table.find_and_call apikeys userid ~if_not_found:begin fun _ ->
         reject_order req w "No API key for %s:%d" username userid ;
         Log.error log_bitmex "No API key for %s:%d" username userid
-      end ~if_found:begin fun { key; secret } ->
+      end ~if_found:begin fun { id ; secret } ->
         (* TODO: Enable selection of execInst *)
-        don't_wait_for (submit_order w ~key ~secret req LastPrice)
+        don't_wait_for (submit_order w ~key:id ~secret req LastPrice)
       end
 
 let reject_cancel_replace_order (req : DTC.Cancel_replace_order.t) addr w k =
@@ -1603,8 +1629,8 @@ let cancel_replace_order addr w msg =
       reject_cancel_replace_order req addr w "Order Not Found"
   | Some (orderID, userid, o) ->
       let ordType = RespObj.string_exn o "ordType" |> OrderType.of_string in
-      let { ApiKey.key ; secret } = Int.Table.find_exn apikeys userid in
-      don't_wait_for (amend_order addr w req key secret orderID ordType)
+      let { ApiKey.id ; secret } = Int.Table.find_exn apikeys userid in
+      don't_wait_for (amend_order addr w req id secret orderID ordType)
 
 let reject_cancel_order (req : DTC.Cancel_order.t) addr w k =
   let rej = DTC.default_order_update () in
@@ -1640,8 +1666,8 @@ let cancel_order addr w msg =
         Log.error log_bitmex "Order Cancel: Order Not Found" ;
         reject_cancel_order req addr w "Order Not Found"
     | Some (orderID, userid, o) ->
-        let { ApiKey.key ; secret } = Int.Table.find_exn apikeys userid in
-        don't_wait_for @@ cancel_order req addr w key secret orderID
+        let { ApiKey.id ; secret } = Int.Table.find_exn apikeys userid in
+        don't_wait_for @@ cancel_order req addr w id secret orderID
 
 let rec handle_chunk addr w consumed buf ~pos ~len =
   if len < 2 then return @@ `Consumed (consumed, `Need_unknown)
@@ -1859,10 +1885,10 @@ let on_ws_msg to_ws_w my_uuid msg =
 
       (* Clients *)
       | Welcome _, Client (conn, userid) ->
-          let { ApiKey.key ; secret } =
+          let { ApiKey.id ; secret } =
             Int.Table.find_exn conn.Connection.apikeys userid in
           Pipe.write_without_pushback to_ws_w
-            MD.(auth ~id ~topic:"" ~key ~secret |> to_yojson)
+            MD.(auth ~id ~topic:"" ~key:id ~secret |> to_yojson)
       | Error err, Client (conn, userid) ->
           Log.error log_bitmex "[%s] %d: error %s" conn.addr userid err ;
       | Response { request = AuthKey _ ; success}, Client (conn, userid) ->
