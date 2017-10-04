@@ -478,11 +478,11 @@ module TradeHistory = struct
     String.Map.add ~key:"tradeAccount"
       ~data:(`String (trade_accountf ~userid ~username))
 
-  let get ~userid ~username ~id ~secret =
+  let get ~userid ~username ~key ~secret =
     let filter = `Assoc ["execType", `String "Trade"] in
     REST.Execution.trade_history ~count:500
       ~buf ~log:log_bitmex ~testnet:!use_testnet
-      ~filter ~key:id ~secret () >>| function
+      ~filter ~key ~secret () >>| function
     | Error err ->
       Log.error log_bitmex "%s" (Error.to_string_hum err) ;
       Error err
@@ -507,12 +507,12 @@ module TradeHistory = struct
     end
 
   let get ?(min_ts=Time_ns.epoch) { Connection.apikeys ; usernames } ~userid =
-    let { ApiKey.id ; secret } = Int.Table.find_exn apikeys userid in
+    let { ApiKey.id = key ; secret } = Int.Table.find_exn apikeys userid in
     let username = Int.Table.find_exn usernames userid in
     match Int.Table.find table userid with
     | Some trades -> Deferred.Or_error.return (filter_trades min_ts trades)
     | None ->
-        Deferred.Or_error.(get ~userid ~username ~id ~secret >>| filter_trades min_ts)
+        Deferred.Or_error.(get ~userid ~username ~key ~secret >>| filter_trades min_ts)
 
   let get_one = String.Table.find trades_by_uuid
 
@@ -692,7 +692,7 @@ let write_trade_accounts ?request_id
 
 let add_api_keys
     { Connection.addr; apikeys; usernames; accounts }
-    ({ ApiKey.id ; secret ; userId ; username } as apikey) =
+    ({ ApiKey.userId ; username } as apikey) =
   Int.Table.set apikeys ~key:userId ~data:apikey ;
   Int.Table.set usernames userId username ;
   String.Table.set accounts username userId ;
@@ -1408,22 +1408,21 @@ let historical_order_fills_request addr w msg =
       Log.error log_bitmex
         "[%s] -> Historical Order Fills Reject: trade account unspecified" addr
     | "", Some (_username, userid) -> begin
-        match Int.Table.find apikeys userid with
-        | Some { id ; secret } ->
-            don't_wait_for begin
-              TradeHistory.get ?min_ts conn ~userid >>| function
-              | Error err ->
-                  Log.error log_bitmex "%s" @@ Error.to_string_hum err ;
-                  reject_historical_order_fills_request ?request_id:req.request_id w
-                    "Error fetching historical order fills from BitMEX"
-              | Ok trades when String.Map.is_empty trades ->
-                  write_no_historical_order_fills req w
-              | Ok trades ->
-                  send_historical_order_fills_response req addr trade_account w trades
-            end
-        | None ->
+        match Int.Table.mem apikeys userid with
+        | false ->
             reject_historical_order_fills_request ?request_id:req.request_id w
               "No such account %s" trade_account
+        | true -> don't_wait_for begin
+            TradeHistory.get ?min_ts conn ~userid >>| function
+            | Error err ->
+                Log.error log_bitmex "%s" @@ Error.to_string_hum err ;
+                reject_historical_order_fills_request ?request_id:req.request_id w
+                  "Error fetching historical order fills from BitMEX"
+            | Ok trades when String.Map.is_empty trades ->
+                write_no_historical_order_fills req w
+            | Ok trades ->
+                send_historical_order_fills_response req addr trade_account w trades
+          end
       end
     | orderID, _ ->
         match TradeHistory.get_one orderID with
@@ -1567,9 +1566,9 @@ let submit_new_single_order addr w msg =
       Int.Table.find_and_call apikeys userid ~if_not_found:begin fun _ ->
         reject_order req w "No API key for %s:%d" username userid ;
         Log.error log_bitmex "No API key for %s:%d" username userid
-      end ~if_found:begin fun { id ; secret } ->
+      end ~if_found:begin fun { id = key ; secret } ->
         (* TODO: Enable selection of execInst *)
-        don't_wait_for (submit_order w ~key:id ~secret req LastPrice)
+        don't_wait_for (submit_order w ~key ~secret req LastPrice)
       end
 
 let reject_cancel_replace_order (req : DTC.Cancel_replace_order.t) addr w k =
@@ -1629,8 +1628,8 @@ let cancel_replace_order addr w msg =
       reject_cancel_replace_order req addr w "Order Not Found"
   | Some (orderID, userid, o) ->
       let ordType = RespObj.string_exn o "ordType" |> OrderType.of_string in
-      let { ApiKey.id ; secret } = Int.Table.find_exn apikeys userid in
-      don't_wait_for (amend_order addr w req id secret orderID ordType)
+      let { ApiKey.id = key ; secret } = Int.Table.find_exn apikeys userid in
+      don't_wait_for (amend_order addr w req key secret orderID ordType)
 
 let reject_cancel_order (req : DTC.Cancel_order.t) addr w k =
   let rej = DTC.default_order_update () in
@@ -1666,8 +1665,8 @@ let cancel_order addr w msg =
         Log.error log_bitmex "Order Cancel: Order Not Found" ;
         reject_cancel_order req addr w "Order Not Found"
     | Some (orderID, userid, o) ->
-        let { ApiKey.id ; secret } = Int.Table.find_exn apikeys userid in
-        don't_wait_for @@ cancel_order req addr w id secret orderID
+        let { ApiKey.id = key ; secret } = Int.Table.find_exn apikeys userid in
+        don't_wait_for @@ cancel_order req addr w key secret orderID
 
 let rec handle_chunk addr w consumed buf ~pos ~len =
   if len < 2 then return @@ `Consumed (consumed, `Need_unknown)
