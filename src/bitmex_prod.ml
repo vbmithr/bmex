@@ -1885,10 +1885,10 @@ let on_ws_msg to_ws_w my_uuid msg =
 
       (* Clients *)
       | Welcome _, Client (conn, userid) ->
-          let { ApiKey.id ; secret } =
+          let { ApiKey.id = key ; secret } =
             Int.Table.find_exn conn.Connection.apikeys userid in
           Pipe.write_without_pushback to_ws_w
-            MD.(auth ~id ~topic:"" ~key:id ~secret |> to_yojson)
+            MD.(auth ~id ~topic:"" ~key ~secret |> to_yojson)
       | Error err, Client (conn, userid) ->
           Log.error log_bitmex "[%s] %d: error %s" conn.addr userid err ;
       | Response { request = AuthKey _ ; success}, Client (conn, userid) ->
