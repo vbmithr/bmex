@@ -1595,7 +1595,7 @@ let amend_order addr w req key secret orderID ordType =
   let price2 = if req.price2_is_set = Some true then req.price2 else None in
   let price, stopPx = OrderType.to_price_stopPx ?p1:price1 ?p2:price2 ordType in
   let amend = REST.Order.create_amend
-    ?leavesQty:(Option.map req.quantity ~f:Float.to_int)
+    ?orderQty:(Option.map req.quantity ~f:Float.to_int)
     ?price
     ?stopPx
     ~orderID () in
