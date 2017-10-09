@@ -1840,14 +1840,16 @@ let unsubscribe_client ?(topic="") ~uuid ~addr ~id () =
 
 type stream =
   | Server
-  | Zombie
+  | Zombie of string * int
   | Client of (Connection.t * int)
 
 let conn_userid_of_stream_id stream_id =
   match String.split ~on:'|' stream_id with
-  | [_; addr; userid] ->
-      Option.value_map ~default:Zombie (Connection.find addr)
-        ~f:(fun conn -> Client (conn, Int.of_string userid))
+  | [_; addr; userId] ->
+      let userId = Int.of_string userId in
+      Option.value_map (Connection.find addr)
+        ~default:(Zombie (addr, userId))
+        ~f:(fun conn -> Client (conn, userId))
   | _ -> Server
 
 let bitmex_topics = Bmex_ws.Topic.[Instrument; Quote; OrderBookL2; Trade]
@@ -1859,8 +1861,10 @@ let on_ws_msg to_ws_w my_uuid msg =
   | Subscribe _ -> ()
   | Unsubscribe { id ; topic } -> begin
       match conn_userid_of_stream_id id with
-      | Server -> Log.error log_bitmex "Got Unsubscribe message for server"
-      | Zombie -> Log.debug log_bitmex "Got Unsubscribe message for zombie"
+      | Server ->
+          Log.error log_bitmex "Got Unsubscribe message for server"
+      | Zombie (addr, userId) ->
+          Log.debug log_bitmex "Got Unsubscribe message for zombie %s %d" addr userId
       | Client (conn, userid) ->
           Int.Table.remove conn.subscriptions userid ;
           Log.debug log_bitmex "Got Unsubscribe message for %s" id
@@ -1906,9 +1910,9 @@ let on_ws_msg to_ws_w my_uuid msg =
           let client_update = { Connection.userid ; update } in
           Pipe.write_without_pushback conn.ws_w client_update
 
-      | _, Zombie ->
+      | _, Zombie (addr, userId) ->
           Log.error log_bitmex
-            "Got a message on a zombie subscription, unsubscribing" ;
+            "Got a message on zombie subscription %s %d, unsubscribing" addr userId ;
           Pipe.write_without_pushback to_ws_w @@
           Bmex_ws.MD.(unsubscribe ~id ~topic |> to_yojson)
       | _ -> ()
