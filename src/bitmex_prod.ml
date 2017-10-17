@@ -549,7 +549,7 @@ let send_heartbeat { Connection.addr ; w } span =
       write_message w `heartbeat DTC.gen_heartbeat msg
     end
 
-let write_order_update ?request_id ?(nb_msgs=1) ?(msg_number=1) ~userid ~username ~status ~reason w o =
+let write_order_update ?request_id ~nb_msgs ~msg_number ~userid ~username ~status ~reason w o =
   let open RespObj in
   let cumQty = Option.map (int64 o "cumQty") ~f:Int64.to_float in
   let leavesQty = Option.map (int64 o "leavesQty") ~f:Int64.to_float in
@@ -624,14 +624,14 @@ let status_reason_of_execType_ordStatus e =
 let write_order_update ?request_id ?(nb_msgs=1) ?(msg_number=1) ?status_reason ~userid ~username w o =
   match status_reason with
   | Some (status, reason) ->
-      write_order_update ?request_id ~status ~reason ~userid ~username w o
+      write_order_update ?request_id ~nb_msgs ~msg_number ~status ~reason ~userid ~username w o
   | None ->
       match status_reason_of_execType_ordStatus o with
       | exception Exit -> ()
       | exception Invalid_argument msg ->
           Log.error log_bitmex "Not sending order update for %s" msg
       | status, reason ->
-          write_order_update ?request_id ~status ~reason ~userid ~username w o
+          write_order_update ?request_id ~nb_msgs ~msg_number ~status ~reason ~userid ~username w o
 
 let write_position_update ?request_id ?(nb_msgs=1) ?(msg_number=1) ~userid ~username w p =
   let symbol = RespObj.string p "symbol" in
