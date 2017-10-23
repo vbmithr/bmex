@@ -1523,15 +1523,10 @@ let submit_order w ~key ~secret (req : DTC.Submit_new_single_order.t) stop_exec_
   let timeInForce = Option.value ~default:`tif_unset req.time_in_force in
   let price, stopPx =
     OrderType.to_price_stopPx ?p1:req.price1 ?p2:req.price2 ordType in
-  let execInst =
-    match Option.value ~default:`trade_unset req.open_or_close with
-    | `trade_close -> [ ExecInst.Close ]
-    | `trade_open
-    | `trade_unset -> [] in
   let execInst = match ordType with
     | `order_type_market
-    | `order_type_limit -> execInst
-    | #OrderType.t -> stop_exec_inst :: execInst in
+    | `order_type_limit -> []
+    | #OrderType.t -> [stop_exec_inst] in
   let displayQty, execInst = match timeInForce with
     | `tif_all_or_none -> Some 0, ExecInst.AllOrNone :: execInst
     | #DTC.time_in_force_enum -> None, execInst in
