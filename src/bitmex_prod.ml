@@ -1577,15 +1577,18 @@ let submit_new_single_order addr w msg =
       end
 
 let reject_cancel_replace_order
+    ?symbol
     ?client_order_id
     ?server_order_id
     ?(order_status=`order_status_unspecified)
     (req : DTC.Cancel_replace_order.t) addr w k =
   let rej = DTC.default_order_update () in
+  rej.symbol <- symbol ;
+  rej.exchange <- Some !my_exchange ;
   rej.total_num_messages <- Some 1l ;
   rej.message_number <- Some 1l ;
   rej.client_order_id <- client_order_id ;
-  rej.server_order_id <- server_order_id ;
+  rej.server_order_id <- Option.map server_order_id ~f:Uuid.to_string ;
   rej.order_update_reason <- Some `order_cancel_replace_rejected ;
   rej.order_status <- Some order_status ;
   Printf.ksprintf begin fun info_text ->
@@ -1613,7 +1616,8 @@ let amend_order addr w req key secret (o : Order.t) =
         | Failure msg -> msg
         | _ -> Error.to_string_hum err in
       reject_cancel_replace_order
-        ~server_order_id:(Uuid.to_string o.orderID)
+        ?symbol:o.symbol
+        ~server_order_id:o.orderID
         ?order_status:(Option.map o.ordStatus ~f:OrdStatus.(Fn.compose to_dtc of_string))
         req addr w "%s" err_str;
       Log.error log_bitmex "%s" err_str
@@ -1634,10 +1638,12 @@ let cancel_replace_order addr w msg =
       let order_type = Option.value ~default:`order_type_unset req.order_type in
       let time_in_force = Option.value ~default:`tif_unset req.time_in_force in
       if order_type <> `order_type_unset then
-        reject_cancel_replace_order req addr w
+        reject_cancel_replace_order
+          ?symbol:o.symbol ~server_order_id:o.orderID req addr w
           "Modification of ordType is not supported by BitMEX"
       else if time_in_force <> `tif_unset then
-        reject_cancel_replace_order req addr w
+        reject_cancel_replace_order
+          ?symbol:o.symbol ~server_order_id:o.orderID req addr w
           "Modification of timeInForce is not supported by BitMEX"
       else
       let open Option in
@@ -1646,15 +1652,18 @@ let cancel_replace_order addr w msg =
       end
 
 let reject_cancel_order
+    ?symbol
     ?client_order_id
     ?server_order_id
     ?(order_status=`order_status_unspecified)
     (req : DTC.Cancel_order.t) addr w k =
   let rej = DTC.default_order_update () in
+  rej.symbol <- symbol ;
+  rej.exchange <- Some !my_exchange ;
   rej.total_num_messages <- Some 1l ;
   rej.message_number <- Some 1l ;
   rej.client_order_id <- client_order_id ;
-  rej.server_order_id <- server_order_id ;
+  rej.server_order_id <- Option.map server_order_id ~f:Uuid.to_string ;
   rej.order_status <- Some order_status ;
   rej.order_update_reason <- Some `order_cancel_rejected ;
   Printf.ksprintf begin fun info_text ->
@@ -1674,10 +1683,11 @@ let cancel_order req addr w key secret (o : Order.t) =
         | Failure msg -> msg
         | _ -> Error.to_string_hum err in
       reject_cancel_order
-      ~server_order_id:(Uuid.to_string o.orderID)
-      ?order_status:(Option.map o.ordStatus ~f:OrdStatus.(Fn.compose to_dtc of_string))
-      req addr w "%s" err_str;
-    Log.error log_bitmex "%s" err_str
+        ?symbol:o.symbol
+        ~server_order_id:o.orderID
+        ?order_status:(Option.map o.ordStatus ~f:OrdStatus.(Fn.compose to_dtc of_string))
+        req addr w "%s" err_str;
+      Log.error log_bitmex "%s" err_str
 
 let cancel_order addr w msg =
     let ({ Connection.addr ; order ; apikeys } as conn) = Connection.find_exn addr in
@@ -1695,12 +1705,18 @@ let cancel_order addr w msg =
         match
           Option.value_map o.ordStatus ~default:(OrdStatus.Unknown "") ~f:OrdStatus.of_string
         with
-        | Canceled
-        | PendingCancel ->
+        | Canceled ->
             reject_cancel_order
+              ?symbol:o.symbol
               ?client_order_id:req.client_order_id
               ~order_status:`order_status_canceled
-              req addr w ""
+              req addr w "Order has already been canceled"
+        | PendingCancel ->
+            reject_cancel_order
+              ?symbol:o.symbol
+              ?client_order_id:req.client_order_id
+              ~order_status:`order_status_pending_cancel
+              req addr w "Order is pending cancel"
         | _ ->
             let open Option in
             iter (o.account >>= Int.Table.find apikeys) ~f:begin fun { ApiKey.id = key ; secret } ->
