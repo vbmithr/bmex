@@ -4,8 +4,6 @@
    %%NAME%% %%VERSION%%
   ---------------------------------------------------------------------------*)
 
-(* DTC to BitMEX simple bridge *)
-
 open Core
 open Async
 open Cohttp_async
@@ -13,20 +11,14 @@ open Cohttp_async
 open Bs_devkit
 open Bitmex_types
 open Bmex
+open Bmex_common
 
-module DTC = Dtc_pb.Dtcprotocol_piqi
+open Pbrt
+open Dtc_pb.Dtcprotocol_types
+open Dtc_pb.Dtcprotocol_pb
+
 module WS = Bmex_ws
 module REST = Bmex_rest
-
-let write_message w (typ : DTC.dtcmessage_type) gen msg =
-  let typ =
-    Piqirun.(DTC.gen_dtcmessage_type typ |> to_string |> init_from_string |> int_of_varint) in
-  let msg = (gen msg |> Piqirun.to_string) in
-  let header = Bytes.create 4 in
-  Binary_packing.pack_unsigned_16_little_endian ~buf:header ~pos:0 (4 + String.length msg) ;
-  Binary_packing.pack_unsigned_16_little_endian ~buf:header ~pos:2 typ ;
-  Writer.write w header ;
-  Writer.write w msg
 
 let trade_accountf ~userid ~username =
   username ^ ":" ^ Int.to_string userid
@@ -261,7 +253,6 @@ module Books = struct
         | Update -> Int.Table.set table id { size ; price }
         | Delete -> Int.Table.remove table id
       end;
-      let u = DTC.default_market_depth_update_level () in
       let update_type =
         match action with
         | Partial
@@ -270,14 +261,16 @@ module Books = struct
         | Delete -> `market_depth_delete_level in
       let side =
         match Side.of_string side with
-        | `buy -> Some `at_bid
-        | `sell -> Some `at_ask
+        | `buy -> Some At_bid
+        | `sell -> Some At_ask
         | `buy_sell_unset -> None
       in
-      u.side <- side ;
-      u.price <- Some price ;
-      u.quantity <- Some (Float.of_int size) ;
-      u.update_type <- Some update_type ;
+      let u = default_market_depth_update_level
+          ?side ~price ~quantity:(Float.of_int size) ~update_type () in
+      (* u.side <- side ;
+       * u.price <- Some price ;
+       * u.quantity <- Some (Float.of_int size) ;
+       * u.update_type <- Some update_type ; *)
       let on_connection { Connection.addr; w; subs; subs_depth } =
         let on_symbol_id symbol_id =
           u.symbol_id <- Some symbol_id ;
