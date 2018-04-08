@@ -13,20 +13,11 @@ open Cohttp_async
 open Bs_devkit
 open Bitmex_types
 open Bmex
+open Bmex_common
 
 module DTC = Dtc_pb.Dtcprotocol_piqi
 module WS = Bmex_ws
 module REST = Bmex_rest
-
-let write_message w (typ : DTC.dtcmessage_type) gen msg =
-  let typ =
-    Piqirun.(DTC.gen_dtcmessage_type typ |> to_string |> init_from_string |> int_of_varint) in
-  let msg = (gen msg |> Piqirun.to_string) in
-  let header = Bytes.create 4 in
-  Binary_packing.pack_unsigned_16_little_endian ~buf:header ~pos:0 (4 + String.length msg) ;
-  Binary_packing.pack_unsigned_16_little_endian ~buf:header ~pos:2 typ ;
-  Writer.write w header ;
-  Writer.write w msg
 
 let trade_accountf ~userid ~username =
   username ^ ":" ^ Int.to_string userid
@@ -487,7 +478,7 @@ module TradeHistory = struct
           | Some uuid ->
               let trade = create_trade ~userid ~username ~e in
               Uuid.Table.set trades_by_uuid uuid trade ;
-              Uuid.Map.add a uuid trade
+              Uuid.Map.set a uuid trade
         end in
       Int.Table.set table userid trades ;
       Ok trades
@@ -515,7 +506,7 @@ module TradeHistory = struct
       Uuid.Table.set trades_by_uuid uuid trade ;
       let data = Option.value_map (Int.Table.find table userid)
           ~default:(Uuid.Map.singleton uuid trade)
-          ~f:(Uuid.Map.add ~key:uuid ~data:trade) in
+          ~f:(Uuid.Map.set ~key:uuid ~data:trade) in
       Int.Table.set table ~key:userid ~data
     end
 end
@@ -1792,7 +1783,7 @@ let dtcserver ~server ~port =
   in
   Conduit_async.serve
     ~on_handler_error:(`Call on_handler_error_f)
-    server (Tcp.on_port port) server_fun
+    server (Tcp.Where_to_listen.of_port port) server_fun
 
 let update_trade { Trade.symbol; timestamp; price; size; side } =
   let side = Option.value_map ~default:`buy_sell_unset ~f:Side.of_string side in
@@ -2080,7 +2071,7 @@ let command =
     +> flag "-crt-file" (optional_with_default "ssl/bitmex.crt" string) ~doc:"filename TLS certificate file to use (ssl/bitmex.crt)"
     +> flag "-key-file" (optional_with_default "ssl/bitmex.key" string) ~doc:"filename TLS key file to use (ssl/bitmex.key)"
   in
-  Command.Staged.async ~summary:"BitMEX bridge" spec main
+  Command.Staged.async_spec ~summary:"BitMEX bridge" spec main
 
 let () = Command.run command
 
