@@ -433,7 +433,7 @@ module Quotes = struct
     u.bid_quantity <- Some (Float.of_int bidSize) ;
     u.ask_price <- Some askPrice ;
     u.ask_quantity <- Some (Float.of_int askSize) ;
-    u.date_time <- seconds_int32_of_ts merged_q.timestamp ;
+    u.date_time <- Some (seconds_int32_of_ts merged_q.timestamp) ;
     let on_connection { Connection.addr; w; subs; subs_depth } =
       let on_symbol_id symbol_id =
         u.symbol_id <- Some symbol_id ;
@@ -1027,7 +1027,7 @@ let write_market_data_snapshot ?id addr w symbol
     snap.symbol_id <- id ;
     snap.session_settlement_price <- instr.prevPrice24h ;
     snap.last_trade_price <- instr.lastPrice ;
-    snap.last_trade_date_time <- Option.map instr.timestamp ~f:float_of_ts ;
+    snap.last_trade_date_time <- Option.map instr.timestamp ~f:seconds_float_of_ts ;
     write_message w `market_data_snapshot DTC.gen_market_data_snapshot snap
   end
   else begin
@@ -1050,8 +1050,8 @@ let write_market_data_snapshot ?id addr w symbol
     snap.ask_quantity <- Option.(map askSize ~f:Float.of_int) ;
     snap.last_trade_price <- Some last_trade_price ;
     snap.last_trade_volume <- Some (Int.to_float last_trade_size) ;
-    snap.last_trade_date_time <- Some (float_of_ts last_trade_ts) ;
-    snap.bid_ask_date_time <- Some (float_of_ts last_quote_ts) ;
+    snap.last_trade_date_time <- Some (seconds_float_of_ts last_trade_ts) ;
+    snap.bid_ask_date_time <- Some (seconds_float_of_ts last_quote_ts) ;
     write_message w `market_data_snapshot DTC.gen_market_data_snapshot snap
   end
 
@@ -1808,7 +1808,7 @@ let update_trade { Trade.symbol; timestamp; price; size; side } =
     u.at_bid_or_ask <- Some at_bid_or_ask ;
     u.price <- Some price ;
     u.volume <- Some (Int.to_float size) ;
-    u.date_time <- Some (float_of_ts timestamp) ;
+    u.date_time <- Some (seconds_float_of_ts timestamp) ;
     let on_connection { Connection.addr; w; subs } =
       let on_symbol_id symbol_id =
         u.symbol_id <- Some symbol_id ;
