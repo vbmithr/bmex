@@ -1,0 +1,5 @@
+(executable
+ (name bitmex_prod)
+ (public_name bitmex-prod)
+ (preprocess (pps ppx_sexp_conv ppx_hash ppx_compare))
+ (libraries dtc-pb bs-devkit bmex-common bmex-rest bmex-ws))
